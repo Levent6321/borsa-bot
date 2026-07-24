@@ -1,4 +1,4 @@
-!pip install pyTelegramBotAPI yfinance isyatirimhisse
+
 
 import telebot
 import yfinance as yf
