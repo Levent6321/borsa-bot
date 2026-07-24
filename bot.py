@@ -1,5 +1,4 @@
-
-
+import os
 import telebot
 import yfinance as yf
 import isyatirimhisse
@@ -8,7 +7,11 @@ import math
 import time
 
 # --- BOT AYARLARI ---
-BOT_TOKEN = "8467138801:AAEnADgoXQD3meMoIAuSiuMu-ncSCtP3kUI"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("❌ HATA: BOT_TOKEN ortam değişkeni bulunamadı!")
+    exit(1)
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- BANKA LİSTESİ ---
@@ -24,7 +27,7 @@ def get_company_data(hisse_kodu):
             guncel_fiyat = hist['Close'].iloc[-1]
 
         df = isyatirimhisse.FetchFinancials.fetch_financials(hisse_kodu)
-        if df is None or guncel_fiyat is None: 
+        if df is None or guncel_fiyat is None:
             return None
 
         latest_col = None
@@ -34,9 +37,9 @@ def get_company_data(hisse_kodu):
                     if "/" in str(col):
                         latest_col = col
                         break
-                except: 
+                except:
                     pass
-        if latest_col is None: 
+        if latest_col is None:
             latest_col = df.columns[-2]
 
         ozsermaye_temp = df[df['FINANCIAL_ITEM_CODE'] == '2O'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2O'].empty else 0
@@ -45,15 +48,13 @@ def get_company_data(hisse_kodu):
         kisa_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2A'].empty else 0
         toplam_hisse = 1600000
 
-        # Net Kar (3L kodu)
         net_kar_temp = df[df['FINANCIAL_ITEM_CODE'] == '3L'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '3L'].empty else 0
-        
         favok_temp = df[df['FINANCIAL_ITEM_CODE'] == '6A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '6A'].empty else 0
 
         def temizle(deger):
-            try: 
+            try:
                 return float(str(deger).replace(',', '.').strip())
-            except: 
+            except:
                 return 0.0
 
         ozsermaye = temizle(ozsermaye_temp)
@@ -82,7 +83,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     veri = get_company_data(hisse_kodu)
     if veri is None or "hata" in veri:
         return f"❌ Veri çekilemedi: {veri.get('hata', 'Bilinmeyen hata')}"
-    
+
     f = veri['fiyat']
     hbk = veri['hbk']
     hbdd = veri['hbdd']
@@ -91,7 +92,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     kisa_borc = veri['kisa_borc']
     net_kar = veri['net_kar']
     favok = veri['favok']
-    
+
     is_banka = hisse_kodu in BANKALAR
 
     fk = f / hbk if hbk > 0 else 0
@@ -116,38 +117,40 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     gecerli = [d for d in degerler if d > 0]
     ic_sel_deger = sum(gecerli) / len(gecerli) if gecerli else 0
 
-    # --- RAPOR (BİNLİK NOKTA, KURUŞ VİRGÜL) ---
     def tl_format(deger):
         return f"{deger:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
     rapor = f"📊 **{hisse_kodu} KAPSAMLI DEĞERLEME RAPORU**\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n---\n📈 **Güncel Fiyat:** {tl_format(f)} TL\n"
-    rapor += f"💠 **HBK (Hisse Başı Kar):** {tl_format(hbk)} TL\n" 
+    rapor += f"💠 **HBK (Hisse Başı Kar):** {tl_format(hbk)} TL\n"
     rapor += f"💠 **HBDD (Hisse Başı DD):** {tl_format(hbdd)} TL\n---\n"
-    
+
     rapor += f"**🔮 BİLANÇO BAZLI ADİL DEĞERLER:**\n"
     rapor += f"🔹 Graham Değeri: {tl_format(graham)} TL\n" if not is_banka else "🔹 Graham Değeri: Bankalar için uygun değil\n"
     rapor += f"🔹 PD/DD Bazlı Hedef: {tl_format(hedef_pddd)} TL\n"
     if not is_banka:
         rapor += f"🔹 FD/FAVÖK Bazlı Hedef: {tl_format(hedef_fd_favok)} TL\n"
-    
+
     rapor += f"---\n**📈 BÜYÜME VE KÂRLILIK BAZLI ADİL DEĞERLER:**\n"
     if not is_banka:
         rapor += f"🔸 Peter Lynch Değeri: {tl_format(peter)} TL\n"
         rapor += f"🔸 PEG Rasyosu: {round(peg, 2)}\n"
     rapor += f"🔸 ROE (Özsermaye Kârlılığı): %{round(roe * 100, 2)}\n"
-    
+
     rapor += f"---\n"
     if ic_sel_deger > 0:
         rapor += f"⭐ **ORTALAMA İÇSEL DEĞER: {tl_format(ic_sel_deger)} TL**\n"
         fark = ((f - ic_sel_deger) / ic_sel_deger) * 100
-        if fark < -5: rapor += f"📈 Piyasa fiyatına göre %{round(abs(fark), 1)} İskontolu\n"
-        elif fark > 5: rapor += f"📉 Piyasa fiyatına göre %{round(fark, 1)} Primli\n"
-        else: rapor += f"⚖️ Piyasa fiyatı adil değere yakın\n"
-    
+        if fark < -5:
+            rapor += f"📈 Piyasa fiyatına göre %{round(abs(fark), 1)} İskontolu\n"
+        elif fark > 5:
+            rapor += f"📉 Piyasa fiyatına göre %{round(fark, 1)} Primli\n"
+        else:
+            rapor += f"⚖️ Piyasa fiyatı adil değere yakın\n"
+
     rapor += f"---\n**🩺 FİNANSAL SAĞLIK:**\n📊 Cari Oran: {round(cari_oran, 2)}\n📊 Kaldıraç: %{round(kaldiraç * 100, 1)}\n"
     if not is_banka and favok > 0:
         rapor += f"📊 Net Borç / FAVÖK: {round(net_borc_favok, 2)}\n"
-    
+
     rapor += f"---\nTemel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n\"Kader ironiye aşıktır. İki 3, üç 2 harften oluşur.\"\n@Levent8263"
     return rapor
 
@@ -156,7 +159,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
 def handle_hesapla(message):
     try:
         komut = message.text.split()
-        if len(komut) < 2: 
+        if len(komut) < 2:
             bot.reply_to(message, "Örnek: /hesapla VESBE")
             return
         bot.reply_to(message, f"🔍 {komut[1].upper()} analiz ediliyor...")
@@ -164,5 +167,5 @@ def handle_hesapla(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Hata: {str(e)}")
 
-print("🤖 Borsa Botu bulutta çalışıyor...")
+print("🤖 Borsa Botu başarıyla başlatıldı. Telegram mesajları bekleniyor...")
 bot.infinity_polling()
