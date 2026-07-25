@@ -41,20 +41,32 @@ def get_company_data(hisse_kodu):
         except Exception:
             temettu_hisse_basi = None
 
-        df = isyatirimhisse.FetchFinancials.fetch_financials(hisse_kodu)
+        # --- DÜZELTME 1: Yıl aralığı artık AÇIKÇA belirtiliyor ---
+        # Eskiden: fetch_financials(hisse_kodu)  -> kütüphane varsayılanına
+        # kalıyordu ve eski (2024/3 gibi) veri dönebiliyordu.
+        guncel_yil = datetime.now().year
+        df = isyatirimhisse.FetchFinancials.fetch_financials(
+            hisse_kodu,
+            start_year=guncel_yil - 1,
+            end_year=guncel_yil,
+        )
         if df is None or guncel_fiyat is None:
             return None
 
-        latest_col = None
+        # --- DÜZELTME 2: "İlk eşleşen" değil, "SON (en güncel) eşleşen"
+        # dönem sütunu seçiliyor. Eskiden ilk bulunan "/" içeren sütunda
+        # durup çıkıyordu (break) — bu genelde en eski dönemi seçmek
+        # anlamına gelebiliyordu. Şimdi tüm eşleşen sütunları toplayıp
+        # en sonuncusunu (en güncel dönemi) alıyoruz.
+        donem_sutunlari = []
         for col in df.columns:
             if col not in ['FINANCIAL_ITEM_CODE', 'FINANCIAL_ITEM_NAME_TR', 'FINANCIAL_ITEM_NAME_EN', 'SYMBOL']:
-                try:
-                    if "/" in str(col):
-                        latest_col = col
-                        break
-                except:
-                    pass
-        if latest_col is None:
+                if "/" in str(col):
+                    donem_sutunlari.append(col)
+
+        if donem_sutunlari:
+            latest_col = donem_sutunlari[-1]
+        else:
             latest_col = df.columns[-2]
 
         ozsermaye_temp = df[df['FINANCIAL_ITEM_CODE'] == '2O'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2O'].empty else 0
