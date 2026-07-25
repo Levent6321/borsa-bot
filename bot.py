@@ -96,8 +96,29 @@ def get_company_data(hisse_kodu):
         donen_varliklar = temizle(donen_varliklar_temp)
         duran_varliklar = temizle(duran_varliklar_temp)
         kisa_borc = temizle(kisa_borc_temp)
-        net_kar = temizle(net_kar_temp)
-        favok = temizle(favok_temp)
+        net_kar_kumulatif = temizle(net_kar_temp)
+        favok_kumulatif = temizle(favok_temp)
+
+        # --- YENİ: BIST çeyreklik raporları KÜMÜLATİFTİR (yıl başından o
+        # aya kadarki toplam). "2026/3" yılın sadece ilk 3 ayını (Q1)
+        # kapsar, yıllık değildir. Gelir tablosu kalemlerini (net kâr,
+        # FAVÖK) yıllıklandırmak için 12/ay_sayısı ile çarpıyoruz.
+        # Bilanço kalemleri (özkaynak, varlıklar, borç) an itibariyle
+        # "stok" değerler olduğu için yıllıklandırılmaz, olduğu gibi kalır.
+        try:
+            _, ay_str = str(latest_col).split("/")
+            ay_sayisi = int(ay_str)
+        except Exception:
+            ay_sayisi = 12  # dönem ayrıştırılamazsa yıllık olduğunu varsay
+
+        if ay_sayisi and 0 < ay_sayisi < 12:
+            yillik_carpan = 12 / ay_sayisi
+        else:
+            yillik_carpan = 1
+            ay_sayisi = 12
+
+        net_kar = net_kar_kumulatif * yillik_carpan
+        favok = favok_kumulatif * yillik_carpan
 
         sonuc = {
             'fiyat': round(guncel_fiyat, 2),
@@ -111,6 +132,8 @@ def get_company_data(hisse_kodu):
             'toplam_hisse': toplam_hisse,
             'donem': latest_col,
             'temettu_hisse_basi': temettu_hisse_basi,
+            'ay_sayisi': ay_sayisi,          # --- YENİ: rapora not düşmek için
+            'yillik_carpan': yillik_carpan,  # --- YENİ ---
         }
         return sonuc
     except Exception as e:
@@ -166,6 +189,8 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     toplam_hisse = veri['toplam_hisse']
     donem = veri['donem']
     temettu_hisse_basi = veri.get('temettu_hisse_basi')
+    ay_sayisi = veri.get('ay_sayisi', 12)
+    yillik_carpan = veri.get('yillik_carpan', 1)
 
     is_banka = hisse_kodu in BANKALAR
 
@@ -216,6 +241,12 @@ def hesapla_ve_rapor_ver(hisse_kodu):
 
     rapor = f"🇹🇷 **{hisse_kodu} GERÇEK ZAMANLI DEĞERLEME RAPORU** 🇹🇷\n"
     rapor += f"📅 Kullanılan Finansal Dönem: {donem}\n"
+    if yillik_carpan != 1:
+        rapor += (
+            f"🔄 *Not: {ay_sayisi} aylık kümülatif kâr/FAVÖK, ×{yillik_carpan:.2f} "
+            f"ile yıllıklandırıldı (basit doğrusal varsayım, mevsimsellik "
+            f"dikkate alınmadı).*\n"
+        )
     rapor += f"💎 Güncel Piyasa Fiyatı: **{tl_format(f)} TL**\n\n"
 
     rapor += f"◆ Graham Değeri: {tl_format(graham)} TL\n"
