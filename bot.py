@@ -17,6 +17,16 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # --- BANKA LİSTESİ ---
 BANKALAR = ["AKBNK", "GARAN", "YKBNK", "ISCTR", "VAKBN", "HALKB", "SKBNK", "TKFEN"]
 
+# --- DCF VARSAYIMLARI ---
+DCF_BUYUME_ORANI = 0.15
+DCF_ISKONTO_ORANI = 0.30
+DCF_TERMINAL_BUYUME = 0.10
+DCF_YIL_SAYISI = 5
+
+# --- GORDON (TEMETTÜ İSKONTO MODELİ) VARSAYIMLARI ---
+GORDON_BUYUME_ORANI = 0.10
+GORDON_ISKONTO_ORANI = 0.30
+
 # --- 1. VERİ ÇEKME VE DÖNÜŞTÜRME FONKSİYONU ---
 def get_company_data(hisse_kodu):
     try:
@@ -25,6 +35,11 @@ def get_company_data(hisse_kodu):
         if guncel_fiyat is None:
             hist = ticker.history(period="1d")
             guncel_fiyat = hist['Close'].iloc[-1]
+
+        try:
+            temettu_hisse_basi = ticker.info.get('dividendRate')
+        except Exception:
+            temettu_hisse_basi = None
 
         df = isyatirimhisse.FetchFinancials.fetch_financials(hisse_kodu)
         if df is None or guncel_fiyat is None:
@@ -46,7 +61,15 @@ def get_company_data(hisse_kodu):
         donen_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1A'].empty else 0
         duran_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AK'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AK'].empty else 0
         kisa_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2A'].empty else 0
-        toplam_hisse = 1600000
+
+        toplam_hisse = ticker.info.get('sharesOutstanding')
+        if not toplam_hisse or toplam_hisse <= 0:
+            try:
+                toplam_hisse = ticker.fast_info.get('shares')
+            except Exception:
+                toplam_hisse = None
+        if not toplam_hisse or toplam_hisse <= 0:
+            return {"hata": f"{hisse_kodu} için hisse adedi (sharesOutstanding) bulunamadı."}
 
         net_kar_temp = df[df['FINANCIAL_ITEM_CODE'] == '3L'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '3L'].empty else 0
         favok_temp = df[df['FINANCIAL_ITEM_CODE'] == '6A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '6A'].empty else 0
@@ -72,11 +95,47 @@ def get_company_data(hisse_kodu):
             'toplam_varliklar': donen_varliklar + duran_varliklar,
             'kisa_borc': kisa_borc,
             'net_kar': net_kar,
-            'favok': favok
+            'favok': favok,
+            'toplam_hisse': toplam_hisse,
+            'donem': latest_col,
+            'temettu_hisse_basi': temettu_hisse_basi,
         }
         return sonuc
     except Exception as e:
         return {"hata": str(e)}
+
+
+def basit_dcf_deger(net_kar, toplam_hisse, buyume=DCF_BUYUME_ORANI,
+                     iskonto=DCF_ISKONTO_ORANI, terminal_buyume=DCF_TERMINAL_BUYUME,
+                     yil=DCF_YIL_SAYISI):
+    """NOT: FCF yerine net kâr kullanılıyor (proxy), gerçek DCF değil."""
+    if not net_kar or net_kar <= 0 or not toplam_hisse or toplam_hisse <= 0:
+        return None
+    if iskonto <= terminal_buyume:
+        return None
+
+    pv_toplam = 0.0
+    nakit_akisi = net_kar
+    for yil_no in range(1, yil + 1):
+        nakit_akisi = nakit_akisi * (1 + buyume)
+        pv_toplam += nakit_akisi / ((1 + iskonto) ** yil_no)
+
+    terminal_deger = nakit_akisi * (1 + terminal_buyume) / (iskonto - terminal_buyume)
+    pv_terminal = terminal_deger / ((1 + iskonto) ** yil)
+
+    toplam_deger = pv_toplam + pv_terminal
+    return toplam_deger / toplam_hisse
+
+
+def gordon_deger(temettu_hisse_basi, buyume=GORDON_BUYUME_ORANI, iskonto=GORDON_ISKONTO_ORANI):
+    """Gordon Büyüme Modeli: D1 / (r - g). Sadece temettü ödeyen şirketlerde anlamlı."""
+    if not temettu_hisse_basi or temettu_hisse_basi <= 0:
+        return None
+    if iskonto <= buyume:
+        return None
+    d1 = temettu_hisse_basi * (1 + buyume)
+    return d1 / (iskonto - buyume)
+
 
 # --- 2. HESAPLAMA FONKSİYONU ---
 def hesapla_ve_rapor_ver(hisse_kodu):
@@ -92,6 +151,9 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     kisa_borc = veri['kisa_borc']
     net_kar = veri['net_kar']
     favok = veri['favok']
+    toplam_hisse = veri['toplam_hisse']
+    donem = veri['donem']
+    temettu_hisse_basi = veri.get('temettu_hisse_basi')
 
     is_banka = hisse_kodu in BANKALAR
 
@@ -107,51 +169,117 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     peg = fk / 15 if fk > 0 else 0
 
     if not is_banka and favok > 0:
-        hedef_fd_favok = (f / ( (f*1600000 + kisa_borc) / favok )) * 10
+        hedef_fd_favok = (f / ((f * toplam_hisse + kisa_borc) / favok)) * 10
         net_borc_favok = kisa_borc / favok
     else:
         hedef_fd_favok = 0
         net_borc_favok = 0
 
+    dcf_deger = basit_dcf_deger(net_kar, toplam_hisse) if not is_banka else None
+    gordon = gordon_deger(temettu_hisse_basi)
+
+    tarihsel_fk = 10
+    hedef_tarihsel_fk = (f / fk) * tarihsel_fk if fk > 0 and tarihsel_fk > 0 else 0
+
+    tahmini_net_kar = net_kar * 2
+    tahmini_hbk = tahmini_net_kar / toplam_hisse if toplam_hisse > 0 else 0
+    future_fk = f / tahmini_hbk if tahmini_hbk > 0 else 0
+    hedef_future_fk = (f / future_fk) * 7 if future_fk > 0 else 0
+
+    hedef_odennis_sermaye = (net_kar / toplam_hisse) * 10 if toplam_hisse > 0 else 0
+
+    ppd = (net_kar * 7) + (0.5 * ozsermaye)
+    hedef_ppd = ppd / toplam_hisse if toplam_hisse > 0 else 0
+
+    hedef_roe = (roe * 10) / pddd if pddd > 0 else 0
+
     degerler = [hedef_pddd, graham, peter, hedef_fd_favok]
+    if dcf_deger is not None and dcf_deger > 0:
+        degerler.append(dcf_deger)
     gecerli = [d for d in degerler if d > 0]
     ic_sel_deger = sum(gecerli) / len(gecerli) if gecerli else 0
 
     def tl_format(deger):
         return f"{deger:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    rapor = f"📊 **{hisse_kodu} KAPSAMLI DEĞERLEME RAPORU**\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n---\n📈 **Güncel Fiyat:** {tl_format(f)} TL\n"
-    rapor += f"💠 **HBK (Hisse Başı Kar):** {tl_format(hbk)} TL\n"
-    rapor += f"💠 **HBDD (Hisse Başı DD):** {tl_format(hbdd)} TL\n---\n"
+    rapor = f"🇹🇷 **{hisse_kodu} GERÇEK ZAMANLI DEĞERLEME RAPORU** 🇹🇷\n"
+    rapor += f"📅 Kullanılan Finansal Dönem: {donem}\n"
+    rapor += f"💎 Güncel Piyasa Fiyatı: **{tl_format(f)} TL**\n\n"
 
-    rapor += f"**🔮 BİLANÇO BAZLI ADİL DEĞERLER:**\n"
-    rapor += f"🔹 Graham Değeri: {tl_format(graham)} TL\n" if not is_banka else "🔹 Graham Değeri: Bankalar için uygun değil\n"
-    rapor += f"🔹 PD/DD Bazlı Hedef: {tl_format(hedef_pddd)} TL\n"
-    if not is_banka:
-        rapor += f"🔹 FD/FAVÖK Bazlı Hedef: {tl_format(hedef_fd_favok)} TL\n"
+    rapor += f"◆ Graham Değeri: {tl_format(graham)} TL\n"
+    rapor += f"◆ Peter Lynch Değeri: {tl_format(peter)} TL\n"
+    rapor += f"◆ PD/DD Bazlı Hedef: {tl_format(hedef_pddd)} TL\n"
+    rapor += f"◆ FD/FAVÖK Bazlı Hedef: {tl_format(hedef_fd_favok)} TL\n"
+    if dcf_deger is not None:
+        rapor += f"◆ DCF Değeri (Basitleştirilmiş): {tl_format(dcf_deger)} TL\n"
+    elif is_banka:
+        rapor += f"◆ DCF Değeri: Bankalar için uygun değil\n"
 
-    rapor += f"---\n**📈 BÜYÜME VE KÂRLILIK BAZLI ADİL DEĞERLER:**\n"
-    if not is_banka:
-        rapor += f"🔸 Peter Lynch Değeri: {tl_format(peter)} TL\n"
-        rapor += f"🔸 PEG Rasyosu: {round(peg, 2)}\n"
-    rapor += f"🔸 ROE (Özsermaye Kârlılığı): %{round(roe * 100, 2)}\n"
+    rapor += f"◆ PEG Rasyosu: {round(peg, 2)}\n"
+    if peg > 0:
+        if peg < 1:
+            rapor += f"   (1'in altında: Hisse büyümesine göre UCUZ görünüyor.)\n"
+        elif peg == 1:
+            rapor += f"   (1'e eşit: Hisse adil değerinde.)\n"
+        else:
+            rapor += f"   (1'in üzerinde: Hisse büyümesine göre PAHALI görünüyor.)\n"
+    else:
+        rapor += f"   (PEG hesaplanamıyor)\n"
 
-    rapor += f"---\n"
+    rapor += f"\n———————————————————————\n"
+
     if ic_sel_deger > 0:
-        rapor += f"⭐ **ORTALAMA İÇSEL DEĞER: {tl_format(ic_sel_deger)} TL**\n"
+        rapor += f"⭐ **GENEL ORTALAMA ADİL DEĞER:**\n**{tl_format(ic_sel_deger)} TL**\n"
+        rapor += f"_(Graham, Peter Lynch, PD/DD, FD/FAVÖK{' ve DCF' if dcf_deger else ''} ortalaması)_\n\n"
         fark = ((f - ic_sel_deger) / ic_sel_deger) * 100
         if fark < -5:
-            rapor += f"📈 Piyasa fiyatına göre %{round(abs(fark), 1)} İskontolu\n"
+            rapor += f"📈 Hisse adil değerine göre %{round(abs(fark), 1)} İSKONTOLU (UCUZ) görünüyor.\n"
         elif fark > 5:
-            rapor += f"📉 Piyasa fiyatına göre %{round(fark, 1)} Primli\n"
+            rapor += f"📉 Hisse adil değerine göre %{round(fark, 1)} PRİMLİ (PAHALI) görünüyor.\n"
         else:
-            rapor += f"⚖️ Piyasa fiyatı adil değere yakın\n"
+            rapor += f"⚖️ Hisse adil değerine göre tam değerinde görünüyor.\n"
 
-    rapor += f"---\n**🩺 FİNANSAL SAĞLIK:**\n📊 Cari Oran: {round(cari_oran, 2)}\n📊 Kaldıraç: %{round(kaldiraç * 100, 1)}\n"
+        if f > ic_sel_deger * 5 or f < ic_sel_deger / 5:
+            rapor += (
+                f"\n⚠️ **UYARI:** Piyasa fiyatı ile hesaplanan adil değer arasında "
+                f"olağandışı büyük bir fark var (5 kattan fazla). Bu, veri "
+                f"kaynağından (dönem karışıklığı, birim hatası vb.) kaynaklanan "
+                f"bir hata olabilir. Sonuçlara temkinli yaklaşın, mümkünse "
+                f"'{donem}' dönemini ve ham verileri manuel kontrol edin.\n"
+            )
+
+    if dcf_deger is not None:
+        rapor += (
+            f"\nℹ️ *DCF notu: Gerçek serbest nakit akışı verisi yerine net kâr "
+            f"kullanıldı (basitleştirilmiş yöntem). Varsayımlar: büyüme "
+            f"%{int(DCF_BUYUME_ORANI*100)}, iskonto %{int(DCF_ISKONTO_ORANI*100)}, "
+            f"terminal büyüme %{int(DCF_TERMINAL_BUYUME*100)}, {DCF_YIL_SAYISI} yıl.*\n"
+        )
+
+    rapor += f"\n📌 **DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
+    if gordon is not None:
+        rapor += (
+            f"◆ Gordon Değeri (Temettü İskonto Modeli): {tl_format(gordon)} TL "
+            f"_(temettü={tl_format(temettu_hisse_basi)} TL, büyüme=%{int(GORDON_BUYUME_ORANI*100)}, "
+            f"iskonto=%{int(GORDON_ISKONTO_ORANI*100)})_\n"
+        )
+    else:
+        rapor += f"◆ Gordon Değeri: Temettü verisi yok veya hesaplanamadı\n"
+    rapor += f"◆ Tarihsel F/K Bazlı Hedef: {tl_format(hedef_tarihsel_fk)} TL (Sabit 10 F/K varsayımı)\n"
+    rapor += f"◆ Future's F/K Bazlı Hedef: {tl_format(hedef_future_fk)} TL (%100 Büyüme varsayımı)\n"
+    rapor += f"◆ Ödenmiş Sermaye Bazlı Hedef: {tl_format(hedef_odennis_sermaye)} TL (HBK x 10)\n"
+    rapor += f"◆ PPD Bazlı Hedef: {tl_format(hedef_ppd)} TL (Geleneksel ağırlık)\n"
+    rapor += f"◆ ROE Bazlı Referans: {round(hedef_roe, 4)} (Deneysel, TL değil)\n"
+
+    rapor += f"\n———————————————————————\n"
+    rapor += f"🩺 **FİNANSAL SAĞLIK:**\n"
+    rapor += f"◆ Cari Oran: {round(cari_oran, 2)}\n"
+    rapor += f"◆ Kaldıraç Oranı: %{round(kaldiraç * 100, 1)}\n"
     if not is_banka and favok > 0:
-        rapor += f"📊 Net Borç / FAVÖK: {round(net_borc_favok, 2)}\n"
+        rapor += f"◆ Net Borç / FAVÖK: {round(net_borc_favok, 2)}\n"
 
-    rapor += f"---\nTemel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n\"Kader ironiye aşıktır. İki 3, üç 2 harften oluşur.\"\n@Levent8263"
+    rapor += f"\n———————————————————————\n"
+    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n\"Kader ironiye aşıktır. İki 3, üç 2 harften oluşur.\"\n@Levent8263"
     return rapor
 
 # --- 3. TELEGRAM KOMUTU ---
