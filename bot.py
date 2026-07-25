@@ -245,15 +245,14 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     hedef_roe = (roe * 10) / pddd if pddd > 0 else 0
 
     degerler = [hedef_pddd, graham, peter, hedef_fd_favok]
-    if dcf_deger is not None and dcf_deger > 0:
-        degerler.append(dcf_deger)
     gecerli = [d for d in degerler if d > 0]
     ic_sel_deger = sum(gecerli) / len(gecerli) if gecerli else 0
 
     def tl_format(deger):
         return f"{deger:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    rapor = f"🇹🇷 **{hisse_kodu} GERÇEK ZAMANLI DEĞERLEME RAPORU** 🇹🇷\n"
+    rapor = f"📊 **{hisse_kodu} KAPSAMLI DEĞERLEME RAPORU** 📊\n"
+    rapor += f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
     rapor += f"📅 Kullanılan Finansal Dönem: {donem}\n"
     if yillik_carpan != 1:
         rapor += (
@@ -261,18 +260,21 @@ def hesapla_ve_rapor_ver(hisse_kodu):
             f"ile yıllıklandırıldı (basit doğrusal varsayım, mevsimsellik "
             f"dikkate alınmadı).*\n"
         )
-    rapor += f"💎 Güncel Piyasa Fiyatı: **{tl_format(f)} TL**\n\n"
+    rapor += f"---\n"
+    rapor += f"📈 **Güncel Fiyat:** {tl_format(f)} TL\n"
+    rapor += f"💠 **HBK (Hisse Başı Kâr):** {tl_format(hbk)} TL\n"
+    rapor += f"💠 **HBDD (Hisse Başı Defter Değeri):** {tl_format(hbdd)} TL\n"
+    rapor += f"---\n\n"
 
-    rapor += f"◆ Graham Değeri: {tl_format(graham)} TL\n"
-    rapor += f"◆ Peter Lynch Değeri: {tl_format(peter)} TL\n"
-    rapor += f"◆ PD/DD Bazlı Hedef: {tl_format(hedef_pddd)} TL\n"
-    rapor += f"◆ FD/FAVÖK Bazlı Hedef: {tl_format(hedef_fd_favok)} TL\n"
-    if dcf_deger is not None:
-        rapor += f"◆ DCF Değeri (Basitleştirilmiş): {tl_format(dcf_deger)} TL\n"
-    elif is_banka:
-        rapor += f"◆ DCF Değeri: Bankalar için uygun değil\n"
+    rapor += f"**🔮 BİLANÇO BAZLI ADİL DEĞERLER:**\n"
+    rapor += f"🔹 Graham Değeri: {tl_format(graham)} TL\n"
+    rapor += f"🔹 PD/DD Bazlı Hedef: {tl_format(hedef_pddd)} TL\n"
+    rapor += f"🔹 FD/FAVÖK Bazlı Hedef: {tl_format(hedef_fd_favok)} TL\n"
+    rapor += f"---\n\n"
 
-    rapor += f"◆ PEG Rasyosu: {round(peg, 2)}\n"
+    rapor += f"**📈 BÜYÜME VE KÂRLILIK BAZLI ADİL DEĞERLER:**\n"
+    rapor += f"🔸 Peter Lynch Değeri: {tl_format(peter)} TL\n"
+    rapor += f"🔸 PEG Rasyosu: {round(peg, 2)}\n"
     if peg > 0:
         if peg < 1:
             rapor += f"   (1'in altında: Hisse büyümesine göre UCUZ görünüyor.)\n"
@@ -282,12 +284,12 @@ def hesapla_ve_rapor_ver(hisse_kodu):
             rapor += f"   (1'in üzerinde: Hisse büyümesine göre PAHALI görünüyor.)\n"
     else:
         rapor += f"   (PEG hesaplanamıyor)\n"
-
-    rapor += f"\n———————————————————————\n"
+    rapor += f"🔸 ROE (Özsermaye Kârlılığı): %{round(roe * 100, 2)}\n"
+    rapor += f"---\n\n"
 
     if ic_sel_deger > 0:
         rapor += f"⭐ **GENEL ORTALAMA ADİL DEĞER:**\n**{tl_format(ic_sel_deger)} TL**\n"
-        rapor += f"_(Graham, Peter Lynch, PD/DD, FD/FAVÖK{' ve DCF' if dcf_deger else ''} ortalaması)_\n\n"
+        rapor += f"_(Graham, Peter Lynch, PD/DD ve FD/FAVÖK ortalaması)_\n\n"
         fark = ((f - ic_sel_deger) / ic_sel_deger) * 100
         if fark < -5:
             rapor += f"📈 Hisse adil değerine göre %{round(abs(fark), 1)} İSKONTOLU (UCUZ) görünüyor.\n"
@@ -305,15 +307,16 @@ def hesapla_ve_rapor_ver(hisse_kodu):
                 f"'{donem}' dönemini ve ham verileri manuel kontrol edin.\n"
             )
 
+    rapor += f"\n📌 **DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
     if dcf_deger is not None:
         rapor += (
-            f"\nℹ️ *DCF notu: Gerçek serbest nakit akışı verisi yerine net kâr "
-            f"kullanıldı (basitleştirilmiş yöntem). Varsayımlar: büyüme "
-            f"%{int(DCF_BUYUME_ORANI*100)}, iskonto %{int(DCF_ISKONTO_ORANI*100)}, "
-            f"terminal büyüme %{int(DCF_TERMINAL_BUYUME*100)}, {DCF_YIL_SAYISI} yıl.*\n"
+            f"◆ DCF Değeri (Basitleştirilmiş): {tl_format(dcf_deger)} TL "
+            f"_(FCF yerine net kâr kullanıldı; büyüme=%{int(DCF_BUYUME_ORANI*100)}, "
+            f"iskonto=%{int(DCF_ISKONTO_ORANI*100)}, terminal=%{int(DCF_TERMINAL_BUYUME*100)}, "
+            f"{DCF_YIL_SAYISI} yıl)_\n"
         )
-
-    rapor += f"\n📌 **DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
+    elif is_banka:
+        rapor += f"◆ DCF Değeri: Bankalar için uygun değil\n"
     if gordon is not None:
         rapor += (
             f"◆ Gordon Değeri (Temettü İskonto Modeli): {tl_format(gordon)} TL "
