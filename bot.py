@@ -306,39 +306,40 @@ def hesapla_ve_rapor_ver(hisse_kodu):
                 f"bir hata olabilir. Sonuçlara temkinli yaklaşın, mümkünse "
                 f"'{donem}' dönemini ve ham verileri manuel kontrol edin.\n"
             )
+    rapor += f"---\n\n"
 
-    rapor += f"\n📌 **DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
+    rapor += f"**📌 DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
     if dcf_deger is not None:
         rapor += (
-            f"◆ DCF Değeri (Basitleştirilmiş): {tl_format(dcf_deger)} TL "
+            f"🔻 DCF Değeri (Basitleştirilmiş): {tl_format(dcf_deger)} TL "
             f"_(FCF yerine net kâr kullanıldı; büyüme=%{int(DCF_BUYUME_ORANI*100)}, "
             f"iskonto=%{int(DCF_ISKONTO_ORANI*100)}, terminal=%{int(DCF_TERMINAL_BUYUME*100)}, "
             f"{DCF_YIL_SAYISI} yıl)_\n"
         )
     elif is_banka:
-        rapor += f"◆ DCF Değeri: Bankalar için uygun değil\n"
+        rapor += f"🔻 DCF Değeri: Bankalar için uygun değil\n"
     if gordon is not None:
         rapor += (
-            f"◆ Gordon Değeri (Temettü İskonto Modeli): {tl_format(gordon)} TL "
+            f"🔻 Gordon Değeri (Temettü İskonto Modeli): {tl_format(gordon)} TL "
             f"_(temettü={tl_format(temettu_hisse_basi)} TL, büyüme=%{int(GORDON_BUYUME_ORANI*100)}, "
             f"iskonto=%{int(GORDON_ISKONTO_ORANI*100)})_\n"
         )
     else:
-        rapor += f"◆ Gordon Değeri: Temettü verisi yok veya hesaplanamadı\n"
-    rapor += f"◆ Tarihsel F/K Bazlı Hedef: {tl_format(hedef_tarihsel_fk)} TL (Sabit 10 F/K varsayımı)\n"
-    rapor += f"◆ Future's F/K Bazlı Hedef: {tl_format(hedef_future_fk)} TL (%100 Büyüme varsayımı)\n"
-    rapor += f"◆ Ödenmiş Sermaye Bazlı Hedef: {tl_format(hedef_odennis_sermaye)} TL (HBK x 10)\n"
-    rapor += f"◆ PPD Bazlı Hedef: {tl_format(hedef_ppd)} TL (Geleneksel ağırlık)\n"
-    rapor += f"◆ ROE Bazlı Referans: {round(hedef_roe, 4)} (Deneysel, TL değil)\n"
+        rapor += f"🔻 Gordon Değeri: Temettü verisi yok veya hesaplanamadı\n"
+    rapor += f"🔻 Tarihsel F/K Bazlı Hedef: {tl_format(hedef_tarihsel_fk)} TL (Sabit 10 F/K varsayımı)\n"
+    rapor += f"🔻 Future's F/K Bazlı Hedef: {tl_format(hedef_future_fk)} TL (%100 Büyüme varsayımı)\n"
+    rapor += f"🔻 Ödenmiş Sermaye Bazlı Hedef: {tl_format(hedef_odennis_sermaye)} TL (HBK x 10)\n"
+    rapor += f"🔻 PPD Bazlı Hedef: {tl_format(hedef_ppd)} TL (Geleneksel ağırlık)\n"
+    rapor += f"🔻 ROE Bazlı Referans: {round(hedef_roe, 4)} (Deneysel, TL değil)\n"
+    rapor += f"---\n\n"
 
-    rapor += f"\n———————————————————————\n"
-    rapor += f"🩺 **FİNANSAL SAĞLIK:**\n"
-    rapor += f"◆ Cari Oran: {round(cari_oran, 2)}\n"
-    rapor += f"◆ Kaldıraç Oranı: %{round(kaldiraç * 100, 1)}\n"
+    rapor += f"**🩺 FİNANSAL SAĞLIK:**\n"
+    rapor += f"📊 Cari Oran: {round(cari_oran, 2)}\n"
+    rapor += f"📊 Kaldıraç Oranı: %{round(kaldiraç * 100, 1)}\n"
     if not is_banka and favok > 0:
-        rapor += f"◆ Net Borç / FAVÖK: {round(net_borc_favok, 2)}\n"
+        rapor += f"📊 Net Borç / FAVÖK: {round(net_borc_favok, 2)}\n"
+    rapor += f"---\n\n"
 
-    rapor += f"\n———————————————————————\n"
     rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n\"Kader ironiye aşıktır. İki 3, üç 2 harften oluşur.\"\n@Levent8263"
     return rapor
 
