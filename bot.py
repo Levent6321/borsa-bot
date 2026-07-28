@@ -219,12 +219,68 @@ def get_bist_data(hisse_kodu):
 
     _t2 = time.time()
     guncel_yil = datetime.now().year
-    df = isyatirimhisse.FetchFinancials.fetch_financials(
-        hisse_kodu,
-        start_year=guncel_yil - 1,
-        end_year=guncel_yil,
-    )
-    print(f"⏱️ [{hisse_kodu}] isyatirim fetch_financials: {time.time() - _t2:.2f}s")
+
+    # --- YENİ: VERİ BÜTÜNLÜĞÜ KONTROLÜ ---
+    # Sadece "df boş değil" kontrolü yeterli değildi — isyatirim bazen
+    # dolu ama EKSİK bir yanıt döndürüyor (örn. en güncel çeyrek sütunu
+    # hiç gelmemiş, veri 1-2 dönem geride kalmış). Bu durumda kod sessizce
+    # eski bir dönemi "en güncel" sanıyordu (FROTO'da aynı gün içinde
+    # 2026/3 ile 2025/12 arasında gidip gelen sonuçların asıl sebebi buydu).
+    # Bu fonksiyon, gelen yanıtta net kâr (3L) kalemi gerçekten dolu mu
+    # diye kontrol ediyor; değilse yanıtı "eksik" sayıp tekrar deniyoruz.
+    def _donem_anahtari_ic(kolon):
+        try:
+            y, a = str(kolon).split("/")
+            return (int(y), int(a))
+        except Exception:
+            return (0, 0)
+
+    def _veri_butun_mu(kontrol_df):
+        if kontrol_df is None or kontrol_df.empty:
+            return False
+        sutunlar = [
+            c for c in kontrol_df.columns
+            if c not in ['FINANCIAL_ITEM_CODE', 'FINANCIAL_ITEM_NAME_TR', 'FINANCIAL_ITEM_NAME_EN', 'SYMBOL']
+            and "/" in str(c)
+        ]
+        if not sutunlar:
+            return False
+        sutunlar.sort(key=_donem_anahtari_ic)
+        son_sutun = sutunlar[-1]
+        seri = kontrol_df[kontrol_df['FINANCIAL_ITEM_CODE'] == '3L']
+        if seri.empty:
+            return False
+        try:
+            deger = seri[son_sutun].values[0]
+            return deger is not None and str(deger).strip() not in ('', 'nan', 'None')
+        except Exception:
+            return False
+
+    # --- RETRY MANTIĞI ---
+    # isyatirim.com.tr sunucusu bazen geçici olarak yavaşlıyor/zaman aşımına
+    # uğruyor (Railway loglarında "Read timed out" görüldü). Tek seferde
+    # pes etmek yerine kısa bir bekleme ile 3 kez deniyoruz — çoğu zaman
+    # ikinci veya üçüncü denemede sunucu tam/eksiksiz cevap veriyor.
+    df = None
+    MAX_DENEME = 3
+    for deneme in range(1, MAX_DENEME + 1):
+        try:
+            aday_df = isyatirimhisse.FetchFinancials.fetch_financials(
+                hisse_kodu,
+                start_year=guncel_yil - 1,
+                end_year=guncel_yil,
+            )
+            if _veri_butun_mu(aday_df):
+                df = aday_df
+                break
+            else:
+                print(f"⚠️ [{hisse_kodu}] deneme {deneme}/{MAX_DENEME}: veri eksik/boş geldi, tekrar denenecek")
+                df = aday_df  # en azından son alınanı sakla, hepsi başarısız olursa yine de kullanılabilir
+        except Exception as e:
+            print(f"⚠️ [{hisse_kodu}] isyatirim deneme {deneme}/{MAX_DENEME} başarısız: {e}")
+        if deneme < MAX_DENEME:
+            time.sleep(2)  # sunucuya nefes alma payı bırak
+    print(f"⏱️ [{hisse_kodu}] isyatirim fetch_financials ({deneme} deneme): {time.time() - _t2:.2f}s")
     if df is None or guncel_fiyat is None:
         return None
 
@@ -233,6 +289,25 @@ def get_bist_data(hisse_kodu):
         if col not in ['FINANCIAL_ITEM_CODE', 'FINANCIAL_ITEM_NAME_TR', 'FINANCIAL_ITEM_NAME_EN', 'SYMBOL']:
             if "/" in str(col):
                 donem_sutunlari.append(col)
+
+    # --- DÜZELTME: KRONOLOJİK SIRALAMA ---
+    # Eskiden donem_sutunlari[-1] (API'nin döndürdüğü son sütun) "en güncel
+    # dönem" varsayılıyordu. Ama isyatirim'in yanıtı ara sıra eksik/kesik
+    # geldiğinde (bkz. Railway loglarındaki "Read timed out" uyarıları),
+    # sütunların sırası değişebiliyor veya en güncel çeyrek (örn. 2026/3)
+    # hiç gelmeyip veri 2025/12'de kalabiliyor — bu da aynı hisse için art
+    # arda yapılan çağrılarda FARKLI dönemlerin seçilmesine (ve dolayısıyla
+    # farklı HBK/Graham/adil değer sonuçlarına) yol açıyordu.
+    # Artık sütunlar "yıl/ay" değerine göre GERÇEKTEN sayısal olarak
+    # sıralanıyor, API'nin döndürme sırasına güvenilmiyor.
+    def _donem_anahtari(kolon):
+        try:
+            y, a = str(kolon).split("/")
+            return (int(y), int(a))
+        except Exception:
+            return (0, 0)
+
+    donem_sutunlari.sort(key=_donem_anahtari)
 
     if donem_sutunlari:
         latest_col = donem_sutunlari[-1]
