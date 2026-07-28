@@ -14,11 +14,14 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# --- BANKA LİSTESİ (sadece BIST için) ---
+# --- BANKA/FİNANS KURULUŞU LİSTESİ (sadece BIST için) ---
 # NOT: TKFEN (Tekfen Holding) buradan çıkarıldı — o bir banka değil,
 # inşaat/tarım ağırlıklı bir holding. Yanlışlıkla bankalar listesindeydi
 # ve gereksiz yere Graham/DCF hesaplarından dışlanıyordu.
-BANKALAR = ["AKBNK", "GARAN", "YKBNK", "ISCTR", "VAKBN", "HALKB", "SKBNK"]
+# KTLEV (Katılımevim Tasarruf Finansman) eklendi — BDDK lisanslı bir
+# finansman şirketi, bankalarla aynı sebepten (farklı bilanço formatı,
+# FD/FAVÖK gibi oranlar anlamsız) burada tutuluyor.
+BANKALAR = ["AKBNK", "GARAN", "YKBNK", "ISCTR", "VAKBN", "HALKB", "SKBNK", "KTLEV"]
 
 # --- DCF VARSAYIMLARI ---
 DCF_BUYUME_ORANI = 0.15
@@ -248,6 +251,18 @@ def get_bist_data(hisse_kodu):
     ttm_gercek = net_kar_ttm_gercek and favok_ttm_gercek
     yillik_carpan = 12 / ay_sayisi if ay_sayisi and ay_sayisi < 12 else 1
 
+    # --- YENİ: Future F/K formülü için gerçek 6 aylık (H1) net kâr ---
+    # Doğru formül: Future F/K = PD / (6 aylık net kâr × 2)
+    net_kar_6ay = None
+    if yil is not None:
+        h1_kolon = f"{yil}/6"
+        h1_deger = item_deger('3L', h1_kolon)
+        if h1_deger is not None and h1_deger > 0:
+            net_kar_6ay = h1_deger
+        elif ay_sayisi == 6:
+            # Zaten 6 aylık dönemdeysek mevcut kümülatif değer budur
+            net_kar_6ay = item_deger('3L', latest_col)
+
     return {
         'fiyat': round(guncel_fiyat, 2),
         'hbdd': ozsermaye / toplam_hisse if toplam_hisse > 0 else 0,
@@ -263,6 +278,7 @@ def get_bist_data(hisse_kodu):
         'ay_sayisi': ay_sayisi,
         'yillik_carpan': yillik_carpan,
         'ttm_gercek': ttm_gercek,  # --- YENİ: gerçek TTM mi, kaba tahmin mi ---
+        'net_kar_6ay': net_kar_6ay,
         'piyasa': 'BIST',
         'para_birimi': 'TL',
     }
@@ -337,26 +353,19 @@ def get_us_data(hisse_kodu):
 
 # --- 1c. EVRENSEL VERİ ÇEKME: önce BIST, olmazsa ABD dener ---
 def get_company_data(hisse_kodu):
+    # --- DEĞİŞİKLİK: ABD borsası desteği devre dışı bırakıldı ---
+    # Sebep: Her /hesapla komutunda önce BIST denenip başarısız olunca
+    # ABD'yi denemek, BIST hisselerinde bile gereksiz gecikmeye (yavaşlığa)
+    # yol açıyordu. Odağı BIST'e geri veriyoruz.
     try:
         veri = get_bist_data(hisse_kodu)
         if veri is not None and "hata" not in veri:
             return veri
-        bist_hata = veri.get("hata") if veri else None
+        bist_hata = veri.get("hata") if veri else "Veri bulunamadı."
     except Exception as e:
         bist_hata = str(e)
 
-    try:
-        veri = get_us_data(hisse_kodu)
-        if veri is not None and "hata" not in veri:
-            return veri
-        us_hata = veri.get("hata") if veri else None
-    except Exception as e:
-        us_hata = str(e)
-
-    return {"hata": (
-        f"Ne BIST'te ne ABD borsalarında '{hisse_kodu}' için veri bulunamadı. "
-        f"Kodu kontrol edin (BIST için örn. VESBE, ABD için örn. AAPL)."
-    )}
+    return {"hata": bist_hata}
 
 
 def basit_dcf_deger(net_kar, toplam_hisse, buyume=DCF_BUYUME_ORANI,
@@ -409,6 +418,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     ay_sayisi = veri.get('ay_sayisi', 12)
     yillik_carpan = veri.get('yillik_carpan', 1)
     ttm_gercek = veri.get('ttm_gercek', True)
+    net_kar_6ay = veri.get('net_kar_6ay')
     piyasa = veri.get('piyasa', 'BIST')
     para_birimi = veri.get('para_birimi', 'TL')
     sembol = "TL" if para_birimi == "TL" else "$"
@@ -442,20 +452,32 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     if sektor_bilgi and sektor_bilgi.get('ort_fk') and hbk > 0:
         sektor_hedef_fk = hbk * sektor_bilgi['ort_fk']
 
-    tarihsel_fk = 10
-    hedef_tarihsel_fk = (f / fk) * tarihsel_fk if fk > 0 and tarihsel_fk > 0 else 0
+    # --- DÜZELTME: Tarihsel/Future F/K artık keyfi sabitler yerine gerçek
+    # sektör (veya BIST100 hazır olduğunda) F/K'sını çarpan olarak kullanıyor.
+    # Sektör verisi yoksa bu deneysel değerler hesaplanamaz, "N/A" gösterilir.
+    carpan_fk = sektor_bilgi['ort_fk'] if sektor_bilgi and sektor_bilgi.get('ort_fk') else None
 
-    tahmini_net_kar = net_kar * 2
-    tahmini_hbk = tahmini_net_kar / toplam_hisse if toplam_hisse > 0 else 0
-    future_fk = f / tahmini_hbk if tahmini_hbk > 0 else 0
-    hedef_future_fk = (f / future_fk) * 7 if future_fk > 0 else 0
+    # Tarihsel F/K: gerçek 3 yıllık ortalama F/K verisi şu an çekilmiyor
+    # (geçmiş her dönem için ayrı fiyat verisi gerektirir), bu yüzden bu
+    # değer güvenilir değildir ve raporda ayrıca işaretlenir.
+    hedef_tarihsel_fk = None  # yeterli veri yok, gösterilmeyecek
+
+    # Future F/K: PD / (6 aylık net kâr × 2) — dokümandaki formül birebir
+    if net_kar_6ay and net_kar_6ay > 0 and carpan_fk:
+        piyasa_degeri = f * toplam_hisse
+        future_fk = piyasa_degeri / (net_kar_6ay * 2)
+        hedef_future_fk = (f / future_fk) * carpan_fk if future_fk > 0 else None
+    else:
+        hedef_future_fk = None
 
     hedef_odennis_sermaye = (net_kar / toplam_hisse) * 10 if toplam_hisse > 0 else 0
 
     ppd = (net_kar * 7) + (0.5 * ozsermaye)
     hedef_ppd = ppd / toplam_hisse if toplam_hisse > 0 else 0
 
-    hedef_roe = (roe * 10) / pddd if pddd > 0 else 0
+    # --- DÜZELTME: sondaki "× Hisse Fiyatı" adımı eklendi (kaynak formülle
+    # doğrulandı, önceden eksikti — bu yüzden anlamsız küçük sayı çıkıyordu) ---
+    hedef_roe = ((roe * 10) / pddd) * f if pddd > 0 else None
 
     degerler = [hedef_pddd, graham, peter, hedef_fd_favok]
     gecerli = [d for d in degerler if d > 0]
@@ -526,6 +548,19 @@ def hesapla_ve_rapor_ver(hisse_kodu):
                 f"olağandışı büyük bir fark var (5 kattan fazla). Sonuçlara "
                 f"temkinli yaklaşın, mümkünse ham verileri manuel kontrol edin.\n"
             )
+
+        if pddd and pddd > 8:
+            rapor += (
+                f"\n⚠️ **UYARI:** Bu şirketin PD/DD oranı çok yüksek (şu an "
+                f"{round(pddd, 1)}x) — bu genelde hisse geri alımları "
+                f"(buyback) nedeniyle defter değeri çok düşük olan, "
+                f"\"varlık hafif\" (asset-light) şirketlerde görülür (Apple "
+                f"gibi ABD teknoloji devlerinde yaygın). Bu durumda Graham "
+                f"ve PD/DD Bazlı Hedef gibi varlık-temelli formüller "
+                f"anlamlı sonuç vermez, ortalamayı yapay şekilde aşağı "
+                f"çeker. Bu tür şirketlerde DCF veya büyüme çarpanlarına "
+                f"bakmak daha doğru olur.\n"
+            )
     rapor += f"---\n\n"
 
     rapor += f"**📌 DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
@@ -565,11 +600,20 @@ def hesapla_ve_rapor_ver(hisse_kodu):
         )
     else:
         rapor += f"🔻 Gordon Değeri: Temettü verisi yok veya hesaplanamadı\n"
-    rapor += f"🔻 Tarihsel F/K Bazlı Hedef: {tl(hedef_tarihsel_fk)} {sembol} (Sabit 10 F/K varsayımı)\n"
-    rapor += f"🔻 Future's F/K Bazlı Hedef: {tl(hedef_future_fk)} {sembol} (%100 Büyüme varsayımı)\n"
+    rapor += f"🔻 Tarihsel F/K Bazlı Hedef: N/A _(gerçek 3 yıllık geçmiş F/K verisi henüz çekilmiyor)_\n"
+    if hedef_future_fk is not None:
+        rapor += (
+            f"🔻 Future's F/K Bazlı Hedef: {tl(hedef_future_fk)} {sembol} "
+            f"_(6 aylık kâr × 2 ve sektör F/K'sına göre)_\n"
+        )
+    else:
+        rapor += f"🔻 Future's F/K Bazlı Hedef: N/A _(6 aylık veri veya sektör F/K'sı yok)_\n"
     rapor += f"🔻 Ödenmiş Sermaye Bazlı Hedef: {tl(hedef_odennis_sermaye)} {sembol} (HBK x 10)\n"
     rapor += f"🔻 PPD Bazlı Hedef: {tl(hedef_ppd)} {sembol} (Geleneksel ağırlık)\n"
-    rapor += f"🔻 ROE Bazlı Referans: {round(hedef_roe, 4)} (Deneysel, {sembol} değil)\n"
+    if hedef_roe is not None:
+        rapor += f"🔻 ROE Bazlı Hedef: {tl(hedef_roe)} {sembol} _(× Hisse Fiyatı adımı eklendi, artık TL cinsinden)_\n"
+    else:
+        rapor += f"🔻 ROE Bazlı Hedef: N/A\n"
     rapor += f"---\n\n"
 
     rapor += f"**🩺 FİNANSAL SAĞLIK:**\n"
@@ -591,6 +635,52 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     return rapor
 
 # --- 3. TELEGRAM KOMUTU ---
+# --- YENİ: /debug KOMUTU ---
+# Bir hissenin isyatirim'den gelen TÜM ham kalem kodlarını ve isimlerini
+# gösterir. Amaç: Hasılat, Stoklar, Ticari Alacaklar gibi henüz kod
+# numarasını bilmediğimiz kalemleri GERÇEK veriden bulmak — tahmin
+# etmek yerine. Çıktıyı görüp doğru kodları koda ekleyeceğiz.
+@bot.message_handler(commands=['debug'])
+def handle_debug(message):
+    try:
+        komut = message.text.split()
+        if len(komut) < 2:
+            bot.reply_to(message, "Örnek: /debug EREGL")
+            return
+        hisse_kodu = komut[1].upper()
+        bot.reply_to(message, f"🔍 {hisse_kodu} için ham veri kalemleri çekiliyor...")
+
+        guncel_yil = datetime.now().year
+        df = isyatirimhisse.FetchFinancials.fetch_financials(
+            hisse_kodu,
+            start_year=guncel_yil - 1,
+            end_year=guncel_yil,
+        )
+        if df is None or df.empty:
+            bot.reply_to(message, "❌ Veri bulunamadı.")
+            return
+
+        # Sütun isimlerini göster (hangi dönemler geldi?)
+        kolon_metni = "📋 **Gelen dönem sütunları:**\n" + ", ".join([str(c) for c in df.columns]) + "\n\n"
+        bot.reply_to(message, kolon_metni)
+
+        # Her kalem kodu + Türkçe ismini listele (tekrar etmeden)
+        if 'FINANCIAL_ITEM_CODE' in df.columns and 'FINANCIAL_ITEM_NAME_TR' in df.columns:
+            satirlar = []
+            for _, row in df.iterrows():
+                kod = row.get('FINANCIAL_ITEM_CODE', '?')
+                isim = row.get('FINANCIAL_ITEM_NAME_TR', '?')
+                satirlar.append(f"{kod} → {isim}")
+            # Telegram mesaj uzunluğu sınırlı, parçalara bölerek gönder
+            metin = "\n".join(satirlar)
+            for i in range(0, len(metin), 3500):
+                bot.reply_to(message, metin[i:i+3500])
+        else:
+            bot.reply_to(message, "⚠️ FINANCIAL_ITEM_CODE/NAME_TR sütunları bulunamadı, DataFrame yapısı beklenenden farklı.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Hata: {str(e)}")
+
+
 @bot.message_handler(commands=['hesapla'])
 def handle_hesapla(message):
     try:
