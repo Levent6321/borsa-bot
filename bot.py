@@ -35,10 +35,10 @@ GORDON_ISKONTO_ORANI = 0.30
 
 
 def cari_oran_yorum(deger):
-    """Cari Oran: kısa vadeli borç ödeme gücü. >2 güçlü, 1-2 normal, <1 riskli."""
+    """Cari Oran: kısa vadeli borç ödeme gücü. İdeal aralık 1,5-2,5."""
     if deger <= 0:
         return "veri yok"
-    if deger >= 2:
+    if 1.5 <= deger <= 2.5:
         return "İyi"
     elif deger >= 1:
         return "Normal"
@@ -47,12 +47,12 @@ def cari_oran_yorum(deger):
 
 
 def kaldirac_yorum(yuzde):
-    """Kaldıraç Oranı (Borç/Varlık %): <%40 düşük risk, %40-60 normal, >%60 yüksek risk."""
+    """Kaldıraç Oranı (Toplam Borç/Toplam Varlık %): kaynağa göre ≤%50 istenir."""
     if yuzde <= 0:
         return "veri yok"
-    if yuzde < 40:
+    if yuzde <= 50:
         return "İyi"
-    elif yuzde < 60:
+    elif yuzde <= 65:
         return "Normal"
     else:
         return "Riskli"
@@ -186,6 +186,11 @@ def get_bist_data(hisse_kodu):
     donen_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1A'].empty else 0
     duran_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AK'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AK'].empty else 0
     kisa_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2A'].empty else 0
+    # --- YENİ: /debug ile bulunan gerçek kodlar ---
+    stoklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AF'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AF'].empty else 0
+    ticari_alacaklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AC'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AC'].empty else 0
+    toplam_varliklar_gercek_temp = df[df['FINANCIAL_ITEM_CODE'] == '1BL'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1BL'].empty else 0
+    uzun_vadeli_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2B'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2B'].empty else 0
 
     toplam_hisse = ticker.info.get('sharesOutstanding')
     if not toplam_hisse or toplam_hisse <= 0:
@@ -206,6 +211,10 @@ def get_bist_data(hisse_kodu):
     donen_varliklar = temizle(donen_varliklar_temp)
     duran_varliklar = temizle(duran_varliklar_temp)
     kisa_borc = temizle(kisa_borc_temp)
+    stoklar = temizle(stoklar_temp)
+    ticari_alacaklar = temizle(ticari_alacaklar_temp)
+    toplam_varliklar_gercek = temizle(toplam_varliklar_gercek_temp)
+    uzun_vadeli_borc = temizle(uzun_vadeli_borc_temp)
 
     # --- YENİ: GERÇEK TTM (SON 4 ÇEYREK) HESAPLAMASI ---
     # Formül: TTM = Bu yılki kümülatif + Geçen yılın tamamı(12 ay) - Geçen yılın aynı dönemi
@@ -248,6 +257,10 @@ def get_bist_data(hisse_kodu):
 
     net_kar, net_kar_ttm_gercek = ttm_hesapla('3L')
     favok, favok_ttm_gercek = ttm_hesapla('6A')
+    # --- YENİ: Hasılat ve Satışların Maliyeti de TTM olarak hesaplanıyor ---
+    hasilat, hasilat_ttm_gercek = ttm_hesapla('3C')
+    satislarin_maliyeti_ham, cogs_ttm_gercek = ttm_hesapla('3CA')
+    satislarin_maliyeti = abs(satislarin_maliyeti_ham)  # "(-)" işaretli kalem, mutlak değer alınıyor
     ttm_gercek = net_kar_ttm_gercek and favok_ttm_gercek
     yillik_carpan = 12 / ay_sayisi if ay_sayisi and ay_sayisi < 12 else 1
 
@@ -268,8 +281,15 @@ def get_bist_data(hisse_kodu):
         'hbdd': ozsermaye / toplam_hisse if toplam_hisse > 0 else 0,
         'hbk': net_kar / toplam_hisse if toplam_hisse > 0 else 0,
         'ozsermaye': ozsermaye,
-        'toplam_varliklar': donen_varliklar + duran_varliklar,
+        'toplam_varliklar': toplam_varliklar_gercek if toplam_varliklar_gercek > 0 else (donen_varliklar + duran_varliklar),
+        'donen_varliklar': donen_varliklar,
+        'duran_varliklar': duran_varliklar,
         'kisa_borc': kisa_borc,
+        'uzun_vadeli_borc': uzun_vadeli_borc,
+        'stoklar': stoklar,
+        'ticari_alacaklar': ticari_alacaklar,
+        'hasilat': hasilat,
+        'satislarin_maliyeti': satislarin_maliyeti,
         'net_kar': net_kar,
         'favok': favok,
         'toplam_hisse': toplam_hisse,
@@ -409,7 +429,14 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     hbdd = veri['hbdd']
     ozsermaye = veri['ozsermaye']
     aktif = veri['toplam_varliklar']
+    donen_varliklar = veri.get('donen_varliklar', 0)
+    duran_varliklar = veri.get('duran_varliklar', 0)
     kisa_borc = veri['kisa_borc']
+    uzun_vadeli_borc = veri.get('uzun_vadeli_borc', 0)
+    stoklar = veri.get('stoklar', 0)
+    ticari_alacaklar = veri.get('ticari_alacaklar', 0)
+    hasilat = veri.get('hasilat', 0)
+    satislarin_maliyeti = veri.get('satislarin_maliyeti', 0)
     net_kar = veri['net_kar']
     favok = veri['favok']
     toplam_hisse = veri['toplam_hisse']
@@ -429,7 +456,30 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     pddd = f / hbdd if hbdd > 0 else 0
     roe = net_kar / ozsermaye if ozsermaye > 0 else 0
     cari_oran = aktif / kisa_borc if kisa_borc > 0 else 0
-    kaldiraç = kisa_borc / aktif if aktif > 0 else 0
+
+    # --- DÜZELTME: Kaldıraç Oranı artık kaynağa göre doğru hesaplanıyor:
+    # (Kısa + Uzun Vadeli Toplam Borç) / Toplam Varlıklar
+    # Eskiden sadece kısa vadeli borç kullanılıyordu, bu şirketin gerçek
+    # borçluluğunu OLDUĞUNDAN DÜŞÜK gösteriyordu. ---
+    toplam_borc = kisa_borc + uzun_vadeli_borc
+    kaldiraç = toplam_borc / aktif if aktif > 0 else 0
+
+    # --- YENİ: Asit-Test Oranı (Dönen Varlıklar - Stoklar) / Kısa Vadeli Borç ---
+    asit_test = (donen_varliklar - stoklar) / kisa_borc if kisa_borc > 0 else 0
+
+    # --- YENİ: Duran Varlıkların Özsermayeye Oranı ---
+    duran_ozkaynak_orani = duran_varliklar / ozsermaye if ozsermaye > 0 else 0
+
+    # --- YENİ: Alacak Devir Hızı = Hasılat / Ticari Alacaklar ---
+    alacak_devir_hizi = hasilat / ticari_alacaklar if ticari_alacaklar > 0 else 0
+
+    # --- YENİ: Stok Devir Hızı = Satışların Maliyeti / Stoklar ---
+    # NOT: Doğrusu "ortalama stok" kullanmaktır (dönem başı+sonu / 2),
+    # şu an sadece dönem sonu stok kullanılıyor (yaklaşık değer).
+    stok_devir_hizi = satislarin_maliyeti / stoklar if stoklar > 0 else 0
+
+    # --- YENİ: Net Kâr Marjı = Net Kâr / Hasılat ---
+    net_kar_marji = net_kar / hasilat if hasilat > 0 else 0
 
     hedef_pddd = (f / pddd) * 1.3 if pddd > 0 else 0
     graham = math.sqrt(22.5 * hbk * hbdd) if (hbk > 0 and hbdd > 0 and not is_banka) else 0
@@ -618,9 +668,19 @@ def hesapla_ve_rapor_ver(hisse_kodu):
 
     rapor += f"**🩺 FİNANSAL SAĞLIK:**\n"
     rapor += f"📊 Cari Oran: {round(cari_oran, 2)} ({cari_oran_yorum(cari_oran)})\n"
+    if asit_test > 0:
+        rapor += f"📊 Asit-Test Oranı: {round(asit_test, 2)} _(ideal: 0,7-1,3)_\n"
     rapor += f"📊 Kaldıraç Oranı: %{round(kaldiraç * 100, 1)} ({kaldirac_yorum(kaldiraç * 100)})\n"
+    if duran_ozkaynak_orani > 0:
+        rapor += f"📊 Duran Varlık/Özsermaye: {round(duran_ozkaynak_orani, 2)} _(ideal: ≤1)_\n"
     if not is_banka and favok > 0:
         rapor += f"📊 Net Borç / FAVÖK: {round(net_borc_favok, 2)}\n"
+    if alacak_devir_hizi > 0:
+        rapor += f"📊 Alacak Devir Hızı: {round(alacak_devir_hizi, 2)} _(ideal: >2)_\n"
+    if stok_devir_hizi > 0:
+        rapor += f"📊 Stok Devir Hızı: {round(stok_devir_hizi, 2)} _(ideal: >2, ortalama stok yerine dönem sonu kullanıldı)_\n"
+    if net_kar_marji != 0:
+        rapor += f"📊 Net Kâr Marjı: %{round(net_kar_marji * 100, 2)} _(ideal: >%8, sektöre göre değişir)_\n"
     rapor += f"---\n\n"
 
     if piyasa == 'ABD':
