@@ -93,15 +93,25 @@ def hissenin_sektoru(hisse_kodu):
 
 def sektor_ortalama_carpanlar(hisse_kodu):
     """
-    Aynı sektördeki diğer hisselerin F/K ve PD/DD ortalamasını hesaplar.
-    NOT: Sadece 2-4 hisselik küçük gruplar olduğu için istatistiksel
+    Aynı sektördeki diğer hisselerin F/K ve PD/DD medyanını hesaplar.
+    NOT: Sadece 2-5 hisselik küçük gruplar olduğu için istatistiksel
     olarak "kesin" bir sektör ortalaması değil, kaba bir emsal kıyaslaması.
     Ortalamaya (Genel Ortalama Adil Değer'e) dahil edilmez, sadece bağlam
     sağlamak için deneysel bölümde gösterilir.
+
+    DÜZELTME: Aritmetik ortalama yerine MEDYAN kullanılıyor ve aşırı uçuk
+    F/K (>60) ile PD/DD (>10) değerleri filtreleniyor. Sebep: küçük emsal
+    gruplarında (özellikle sektörün geneli düşük kârlılık yaşadığında) tek
+    bir aşırı yüksek F/K'lı hisse, ortalamayı anlamsız şekilde şişirebiliyor
+    (örn. EREGL testinde "Sektör Ort. F/K: 171" gibi gerçekçi olmayan bir
+    sonuç çıkmıştı — medyan ve filtre bunu büyük ölçüde engeller).
     """
     sektor, emsaller = hissenin_sektoru(hisse_kodu)
     if sektor is None:
         return None
+
+    FK_UST_SINIR = 60
+    PDDD_UST_SINIR = 10
 
     fk_listesi = []
     pddd_listesi = []
@@ -118,18 +128,31 @@ def sektor_ortalama_carpanlar(hisse_kodu):
         hbk_emsal = veri['hbk']
         hbdd_emsal = veri['hbdd']
         if hbk_emsal and hbk_emsal > 0:
-            fk_listesi.append(f_emsal / hbk_emsal)
+            fk_emsal = f_emsal / hbk_emsal
+            if 0 < fk_emsal <= FK_UST_SINIR:
+                fk_listesi.append(fk_emsal)
         if hbdd_emsal and hbdd_emsal > 0:
-            pddd_listesi.append(f_emsal / hbdd_emsal)
+            pddd_emsal = f_emsal / hbdd_emsal
+            if 0 < pddd_emsal <= PDDD_UST_SINIR:
+                pddd_listesi.append(pddd_emsal)
 
     if not fk_listesi and not pddd_listesi:
         return None
 
+    def medyan(liste):
+        s = sorted(liste)
+        n = len(s)
+        orta = n // 2
+        if n % 2 == 0:
+            return (s[orta - 1] + s[orta]) / 2
+        return s[orta]
+
     return {
         'sektor': sektor,
         'emsal_sayisi': len(emsaller) - 1,
-        'ort_fk': sum(fk_listesi) / len(fk_listesi) if fk_listesi else None,
-        'ort_pddd': sum(pddd_listesi) / len(pddd_listesi) if pddd_listesi else None,
+        'ort_fk': medyan(fk_listesi) if fk_listesi else None,
+        'ort_pddd': medyan(pddd_listesi) if pddd_listesi else None,
+        'kullanilan_emsal_sayisi': len(fk_listesi),  # filtre sonrası kaç hisse gerçekten kullanıldı
     }
 
 
@@ -244,16 +267,41 @@ def get_bist_data(hisse_kodu):
             return 0.0, False
         if ay_sayisi == 12 or yil is None:
             return guncel, True  # zaten yıllık veri
+
+        # 1. Deneme: isme göre ara ("2025/12", "2025/3" gibi)
         onceki_tam_yil_kolon = f"{yil - 1}/12"
         ayni_donem_gecen_yil_kolon = f"{yil - 1}/{ay_sayisi}"
         onceki_tam = item_deger(kod, onceki_tam_yil_kolon)
         ayni_donem = item_deger(kod, ayni_donem_gecen_yil_kolon)
         if onceki_tam is not None and ayni_donem is not None:
             return guncel + onceki_tam - ayni_donem, True  # gerçek TTM
-        else:
-            # Geçmiş yıl verisi yoksa (örn. yeni halka arz), kaba yıllıklandırmaya düş
-            carpan = 12 / ay_sayisi if ay_sayisi else 1
-            return guncel * carpan, False
+
+        # --- YENİ: 2. Deneme: isim eşleşmesi başarısız olursa, POZİSYONA
+        # göre ara. donem_sutunlari kronolojik sırayla tüm dönem
+        # sütunlarını içeriyor (örn. [...,"2025/3","2025/6","2025/9",
+        # "2025/12","2026/3"]). Şirket her yıl 4 çeyrek raporluyorsa:
+        # - "bir önceki tam yıl" = latest_col'dan 1 önceki sütun
+        # - "geçen yılın aynı dönemi" = latest_col'dan 4 önceki sütun
+        try:
+            latest_index = donem_sutunlari.index(latest_col)
+            onceki_tam_idx = latest_index - 1
+            ayni_donem_idx = latest_index - 4
+            if onceki_tam_idx >= 0 and ayni_donem_idx >= 0:
+                onceki_tam_kolon_poz = donem_sutunlari[onceki_tam_idx]
+                ayni_donem_kolon_poz = donem_sutunlari[ayni_donem_idx]
+                # Doğrulama: "bir önceki tam yıl" gerçekten ".../12" ile bitiyor mu?
+                if str(onceki_tam_kolon_poz).endswith("/12"):
+                    onceki_tam_poz = item_deger(kod, onceki_tam_kolon_poz)
+                    ayni_donem_poz = item_deger(kod, ayni_donem_kolon_poz)
+                    if onceki_tam_poz is not None and ayni_donem_poz is not None:
+                        return guncel + onceki_tam_poz - ayni_donem_poz, True
+        except (ValueError, IndexError):
+            pass
+
+        # 3. Son çare: geçmiş yıl verisi hiçbir şekilde bulunamadı
+        # (örn. yeni halka arz), kaba yıllıklandırmaya düş
+        carpan = 12 / ay_sayisi if ay_sayisi else 1
+        return guncel * carpan, False
 
     net_kar, net_kar_ttm_gercek = ttm_hesapla('3L')
     favok, favok_ttm_gercek = ttm_hesapla('6A')
@@ -626,13 +674,13 @@ def hesapla_ve_rapor_ver(hisse_kodu):
                 "gibi kâr-bazlı kıyaslamalar bu sektörde daha az güvenilirdir.*\n"
             )
         if sektor_bilgi.get('ort_fk'):
-            rapor += f"🔻 Sektör Ort. F/K: {round(sektor_bilgi['ort_fk'], 2)}"
+            rapor += f"🔻 Sektör Medyan F/K: {round(sektor_bilgi['ort_fk'], 2)}"
             if sektor_hedef_fk:
                 rapor += f" → Sektöre Göre Hedef: {tl(sektor_hedef_fk)} {sembol}\n"
             else:
                 rapor += "\n"
         if sektor_bilgi.get('ort_pddd'):
-            rapor += f"🔻 Sektör Ort. PD/DD: {round(sektor_bilgi['ort_pddd'], 2)} (bu hissenin PD/DD'si: {round(pddd, 2) if pddd else 'N/A'})\n"
+            rapor += f"🔻 Sektör Medyan PD/DD: {round(sektor_bilgi['ort_pddd'], 2)} (bu hissenin PD/DD'si: {round(pddd, 2) if pddd else 'N/A'})\n"
     if dcf_deger is not None:
         rapor += (
             f"🔻 DCF Değeri (Basitleştirilmiş): {tl(dcf_deger)} {sembol} "
