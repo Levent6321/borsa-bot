@@ -5,6 +5,17 @@ import isyatirimhisse
 from datetime import datetime
 import math
 import time
+import socket
+
+# --- YENİ: SOCKET ZAMAN AŞIMI ARTIRILDI ---
+# Sebep: Railway loglarında isyatirim.com.tr'nin "Read timed out (read
+# timeout=10)" hatası verdiği görüldü — kütüphanenin kendi içinde sabit
+# 10 saniyelik bir zaman aşımı var. isyatirim'in sunucusu bazen 10
+# saniyeden uzun sürebiliyor (bizim kontrolümüz dışında bir yavaşlık).
+# socket.setdefaulttimeout() global bir taban değer koyar; kütüphane
+# açıkça daha kısa bir timeout vermediği sürece bu devreye girer ve
+# isteklerin daha uzun süre beklemesine izin verir.
+socket.setdefaulttimeout(30)
 
 # --- BOT AYARLARI ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -187,23 +198,33 @@ def get_bist_data(hisse_kodu):
             f"sonuç üretmektense bu özelliği henüz devre dışı bıraktık."
         )}
 
+    # --- YENİ: ZAMANLAMA ÖLÇÜMÜ ---
+    # Hangi ağ çağrısının yavaşlığa sebep olduğunu görmek için her adımı
+    # ayrı ayrı ölçüyoruz. Bu print'ler Railway loglarında görünür.
+    _t0 = time.time()
+
     ticker = yf.Ticker(hisse_kodu + ".IS")
     guncel_fiyat = ticker.fast_info['lastPrice']
     if guncel_fiyat is None:
         hist = ticker.history(period="1d")
         guncel_fiyat = hist['Close'].iloc[-1]
+    print(f"⏱️ [{hisse_kodu}] fast_info/history: {time.time() - _t0:.2f}s")
 
+    _t1 = time.time()
     try:
         temettu_hisse_basi = ticker.info.get('dividendRate')
     except Exception:
         temettu_hisse_basi = None
+    print(f"⏱️ [{hisse_kodu}] ticker.info (temettü): {time.time() - _t1:.2f}s")
 
+    _t2 = time.time()
     guncel_yil = datetime.now().year
     df = isyatirimhisse.FetchFinancials.fetch_financials(
         hisse_kodu,
         start_year=guncel_yil - 1,
         end_year=guncel_yil,
     )
+    print(f"⏱️ [{hisse_kodu}] isyatirim fetch_financials: {time.time() - _t2:.2f}s")
     if df is None or guncel_fiyat is None:
         return None
 
@@ -228,7 +249,9 @@ def get_bist_data(hisse_kodu):
     toplam_varliklar_gercek_temp = df[df['FINANCIAL_ITEM_CODE'] == '1BL'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1BL'].empty else 0
     uzun_vadeli_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2B'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2B'].empty else 0
 
+    _t3 = time.time()
     toplam_hisse = ticker.info.get('sharesOutstanding')
+    print(f"⏱️ [{hisse_kodu}] ticker.info (hisse adedi): {time.time() - _t3:.2f}s")
     if not toplam_hisse or toplam_hisse <= 0:
         try:
             toplam_hisse = ticker.fast_info.get('shares')
@@ -812,7 +835,10 @@ def handle_hesapla(message):
             bot.reply_to(message, "Örnek: /hesapla VESBE  (veya ABD için: /hesapla AAPL)")
             return
         bot.reply_to(message, f"🔍 {komut[1].upper()} analiz ediliyor...")
-        bot.reply_to(message, hesapla_ve_rapor_ver(komut[1].upper()))
+        _t_toplam = time.time()
+        rapor = hesapla_ve_rapor_ver(komut[1].upper())
+        print(f"⏱️ [{komut[1].upper()}] TOPLAM /hesapla süresi: {time.time() - _t_toplam:.2f}s")
+        bot.reply_to(message, rapor)
     except Exception as e:
         bot.reply_to(message, f"❌ Hata: {str(e)}")
 
