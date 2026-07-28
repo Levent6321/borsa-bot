@@ -57,12 +57,18 @@ def kaldirac_yorum(yuzde):
     else:
         return "Riskli"
 
-# --- YENİ: SEKTÖR/EMSAL GRUPLARI (gerçek BIST piyasa değeri verisiyle güncellendi) ---
+# --- SEKTÖR/EMSAL GRUPLARI (gerçek BIST piyasa değeri verisiyle güncellendi) ---
 # Her grup, o sektördeki en büyük (en likit) piyasa değerine sahip hisselerden
 # seçildi — performans için grup başına ~5-8 hisseyle sınırlı tutuldu.
 # NOT: GYO (Gayrimenkul Yatırım Ortaklığı) şirketleri gelirlerini gayrimenkul
 # yeniden değerleme kazançlarından da elde ettiği için Graham/Peter Lynch gibi
 # kâr-bazlı formüllerde diğer sektörlere göre daha az güvenilir olabilir.
+#
+# NOT (DEVRE DIŞI BIRAKILDI): Bu grup tanımları hâlâ burada duruyor çünkü
+# sektor_ortalama_carpanlar() fonksiyonu kod tabanından silinmedi — sadece
+# çağrılmıyor (bkz. hesapla_ve_rapor_ver içindeki "sektor_bilgi = None").
+# İleride zaman-bazlı bir cache eklenirse tek satır değiştirilerek geri
+# açılabilir.
 SEKTOR_GRUPLARI = {
     "Otomotiv": ["FROTO", "TOASO", "DOAS", "OTKAR", "BRISA"],
     "Demir-Çelik": ["EREGL", "ISDMR", "BRSAN", "KRDMD", "KRDMA", "KRDMB"],
@@ -98,6 +104,13 @@ def sektor_ortalama_carpanlar(hisse_kodu):
     olarak "kesin" bir sektör ortalaması değil, kaba bir emsal kıyaslaması.
     Ortalamaya (Genel Ortalama Adil Değer'e) dahil edilmez, sadece bağlam
     sağlamak için deneysel bölümde gösterilir.
+
+    NOT: Bu fonksiyon şu an çağrılmıyor (bkz. hesapla_ve_rapor_ver içindeki
+    "sektor_bilgi = None" satırı). Sebep: her çağrıda 4-8 emsal hisseyi
+    ayrı ayrı çekmek (isyatirim + yfinance), tek bir /hesapla komutunu
+    5+ hissenin verisini çekmeye dönüştürüp ciddi yavaşlığa ve rate-limit
+    riskine yol açıyordu. Fonksiyon ileride bir cache mekanizmasıyla
+    birlikte tekrar devreye alınabilir diye silinmedi.
 
     DÜZELTME: Aritmetik ortalama yerine MEDYAN kullanılıyor ve aşırı uçuk
     F/K (>60) ile PD/DD (>10) değerleri filtreleniyor. Sebep: küçük emsal
@@ -209,7 +222,7 @@ def get_bist_data(hisse_kodu):
     donen_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1A'].empty else 0
     duran_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AK'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AK'].empty else 0
     kisa_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2A'].empty else 0
-    # --- YENİ: /debug ile bulunan gerçek kodlar ---
+    # --- /debug ile bulunan gerçek kodlar ---
     stoklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AF'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AF'].empty else 0
     ticari_alacaklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AC'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AC'].empty else 0
     toplam_varliklar_gercek_temp = df[df['FINANCIAL_ITEM_CODE'] == '1BL'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1BL'].empty else 0
@@ -239,7 +252,7 @@ def get_bist_data(hisse_kodu):
     toplam_varliklar_gercek = temizle(toplam_varliklar_gercek_temp)
     uzun_vadeli_borc = temizle(uzun_vadeli_borc_temp)
 
-    # --- YENİ: GERÇEK TTM (SON 4 ÇEYREK) HESAPLAMASI ---
+    # --- GERÇEK TTM (SON 4 ÇEYREK) HESAPLAMASI ---
     # Formül: TTM = Bu yılki kümülatif + Geçen yılın tamamı(12 ay) - Geçen yılın aynı dönemi
     # Bu, son 4 gerçek çeyreği otomatik olarak toplar, mevsimselliği dikkate alır.
     try:
@@ -276,7 +289,7 @@ def get_bist_data(hisse_kodu):
         if onceki_tam is not None and ayni_donem is not None:
             return guncel + onceki_tam - ayni_donem, True  # gerçek TTM
 
-        # --- YENİ: 2. Deneme: isim eşleşmesi başarısız olursa, POZİSYONA
+        # 2. Deneme: isim eşleşmesi başarısız olursa, POZİSYONA
         # göre ara. donem_sutunlari kronolojik sırayla tüm dönem
         # sütunlarını içeriyor (örn. [...,"2025/3","2025/6","2025/9",
         # "2025/12","2026/3"]). Şirket her yıl 4 çeyrek raporluyorsa:
@@ -305,14 +318,14 @@ def get_bist_data(hisse_kodu):
 
     net_kar, net_kar_ttm_gercek = ttm_hesapla('3L')
     favok, favok_ttm_gercek = ttm_hesapla('6A')
-    # --- YENİ: Hasılat ve Satışların Maliyeti de TTM olarak hesaplanıyor ---
+    # --- Hasılat ve Satışların Maliyeti de TTM olarak hesaplanıyor ---
     hasilat, hasilat_ttm_gercek = ttm_hesapla('3C')
     satislarin_maliyeti_ham, cogs_ttm_gercek = ttm_hesapla('3CA')
     satislarin_maliyeti = abs(satislarin_maliyeti_ham)  # "(-)" işaretli kalem, mutlak değer alınıyor
     ttm_gercek = net_kar_ttm_gercek and favok_ttm_gercek
     yillik_carpan = 12 / ay_sayisi if ay_sayisi and ay_sayisi < 12 else 1
 
-    # --- YENİ: Future F/K formülü için gerçek 6 aylık (H1) net kâr ---
+    # --- Future F/K formülü için gerçek 6 aylık (H1) net kâr ---
     # Doğru formül: Future F/K = PD / (6 aylık net kâr × 2)
     net_kar_6ay = None
     if yil is not None:
@@ -345,7 +358,7 @@ def get_bist_data(hisse_kodu):
         'temettu_hisse_basi': temettu_hisse_basi,
         'ay_sayisi': ay_sayisi,
         'yillik_carpan': yillik_carpan,
-        'ttm_gercek': ttm_gercek,  # --- YENİ: gerçek TTM mi, kaba tahmin mi ---
+        'ttm_gercek': ttm_gercek,  # gerçek TTM mi, kaba tahmin mi
         'net_kar_6ay': net_kar_6ay,
         'piyasa': 'BIST',
         'para_birimi': 'TL',
@@ -505,28 +518,26 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     roe = net_kar / ozsermaye if ozsermaye > 0 else 0
     cari_oran = aktif / kisa_borc if kisa_borc > 0 else 0
 
-    # --- DÜZELTME: Kaldıraç Oranı artık kaynağa göre doğru hesaplanıyor:
+    # --- Kaldıraç Oranı kaynağa göre doğru hesaplanıyor:
     # (Kısa + Uzun Vadeli Toplam Borç) / Toplam Varlıklar
-    # Eskiden sadece kısa vadeli borç kullanılıyordu, bu şirketin gerçek
-    # borçluluğunu OLDUĞUNDAN DÜŞÜK gösteriyordu. ---
     toplam_borc = kisa_borc + uzun_vadeli_borc
     kaldiraç = toplam_borc / aktif if aktif > 0 else 0
 
-    # --- YENİ: Asit-Test Oranı (Dönen Varlıklar - Stoklar) / Kısa Vadeli Borç ---
+    # --- Asit-Test Oranı (Dönen Varlıklar - Stoklar) / Kısa Vadeli Borç ---
     asit_test = (donen_varliklar - stoklar) / kisa_borc if kisa_borc > 0 else 0
 
-    # --- YENİ: Duran Varlıkların Özsermayeye Oranı ---
+    # --- Duran Varlıkların Özsermayeye Oranı ---
     duran_ozkaynak_orani = duran_varliklar / ozsermaye if ozsermaye > 0 else 0
 
-    # --- YENİ: Alacak Devir Hızı = Hasılat / Ticari Alacaklar ---
+    # --- Alacak Devir Hızı = Hasılat / Ticari Alacaklar ---
     alacak_devir_hizi = hasilat / ticari_alacaklar if ticari_alacaklar > 0 else 0
 
-    # --- YENİ: Stok Devir Hızı = Satışların Maliyeti / Stoklar ---
+    # --- Stok Devir Hızı = Satışların Maliyeti / Stoklar ---
     # NOT: Doğrusu "ortalama stok" kullanmaktır (dönem başı+sonu / 2),
     # şu an sadece dönem sonu stok kullanılıyor (yaklaşık değer).
     stok_devir_hizi = satislarin_maliyeti / stoklar if stoklar > 0 else 0
 
-    # --- YENİ: Net Kâr Marjı = Net Kâr / Hasılat ---
+    # --- Net Kâr Marjı = Net Kâr / Hasılat ---
     net_kar_marji = net_kar / hasilat if hasilat > 0 else 0
 
     hedef_pddd = (f / pddd) * 1.3 if pddd > 0 else 0
@@ -544,14 +555,18 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     dcf_deger = basit_dcf_deger(net_kar, toplam_hisse) if not is_banka else None
     gordon = gordon_deger(temettu_hisse_basi)
 
-    # --- YENİ: sektör/emsal karşılaştırması (sadece BIST için) ---
-    sektor_bilgi = sektor_ortalama_carpanlar(hisse_kodu) if piyasa == 'BIST' else None
+    # --- DEĞİŞİKLİK: sektör/emsal karşılaştırması geçici olarak kapatıldı ---
+    # Sebep: Her hissede 4-8 emsal hisseyi ayrı ayrı çekmek (isyatirim + yfinance),
+    # tek bir /hesapla komutunu 5+ hissenin verisini çekmeye dönüştürüyordu,
+    # bu da ciddi yavaşlığa ve rate-limit riskine yol açıyordu. İleride
+    # basit bir zaman-bazlı cache (örn. 1 saatlik) ile geri getirilebilir.
+    sektor_bilgi = None
     sektor_hedef_fk = None
     if sektor_bilgi and sektor_bilgi.get('ort_fk') and hbk > 0:
         sektor_hedef_fk = hbk * sektor_bilgi['ort_fk']
 
-    # --- DÜZELTME: Tarihsel/Future F/K artık keyfi sabitler yerine gerçek
-    # sektör (veya BIST100 hazır olduğunda) F/K'sını çarpan olarak kullanıyor.
+    # --- Tarihsel/Future F/K artık keyfi sabitler yerine gerçek sektör
+    # (veya BIST100 hazır olduğunda) F/K'sını çarpan olarak kullanıyor.
     # Sektör verisi yoksa bu deneysel değerler hesaplanamaz, "N/A" gösterilir.
     carpan_fk = sektor_bilgi['ort_fk'] if sektor_bilgi and sektor_bilgi.get('ort_fk') else None
 
@@ -573,7 +588,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     ppd = (net_kar * 7) + (0.5 * ozsermaye)
     hedef_ppd = ppd / toplam_hisse if toplam_hisse > 0 else 0
 
-    # --- DÜZELTME: sondaki "× Hisse Fiyatı" adımı eklendi (kaynak formülle
+    # --- sondaki "× Hisse Fiyatı" adımı eklendi (kaynak formülle
     # doğrulandı, önceden eksikti — bu yüzden anlamsız küçük sayı çıkıyordu) ---
     hedef_roe = ((roe * 10) / pddd) * f if pddd > 0 else None
 
@@ -743,7 +758,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     return rapor
 
 # --- 3. TELEGRAM KOMUTU ---
-# --- YENİ: /debug KOMUTU ---
+# --- /debug KOMUTU ---
 # Bir hissenin isyatirim'den gelen TÜM ham kalem kodlarını ve isimlerini
 # gösterir. Amaç: Hasılat, Stoklar, Ticari Alacaklar gibi henüz kod
 # numarasını bilmediğimiz kalemleri GERÇEK veriden bulmak — tahmin
