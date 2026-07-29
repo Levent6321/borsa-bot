@@ -2,7 +2,7 @@ import os
 import telebot
 import yfinance as yf
 import isyatirimhisse
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import math
 import time
 import socket
@@ -256,6 +256,27 @@ def get_bist_data(hisse_kodu):
         except Exception:
             return (0, 0)
 
+    def _beklenen_min_donem():
+        """
+        Bugünün tarihine göre, BIST'te en geç yayınlanmış olması GEREKEN
+        çeyreği hesaplar (yaklaşık 75 günlük raporlama gecikme payıyla).
+        Örnek: Bugün 29 Temmuz 2026 ise, 2026/3 (31 Mart bitişli çeyrek)
+        75 gün önce (yaklaşık 14 Haziran 2026) yayınlanmış olması
+        gerektiğinden "beklenen minimum dönem" 2026/3 olur.
+        """
+        bugun = date.today()
+        adaylar = []
+        for yil_ad in [bugun.year, bugun.year - 1]:
+            for (ay, gun) in [(3, 31), (6, 30), (9, 30), (12, 31)]:
+                try:
+                    ceyrek_sonu = date(yil_ad, ay, gun)
+                except ValueError:
+                    continue
+                yayin_tahmini = ceyrek_sonu + timedelta(days=75)
+                if yayin_tahmini <= bugun:
+                    adaylar.append((yil_ad, ay))
+        return max(adaylar) if adaylar else (0, 0)
+
     def _veri_butun_mu(kontrol_df):
         if kontrol_df is None or kontrol_df.empty:
             return False
@@ -268,6 +289,17 @@ def get_bist_data(hisse_kodu):
             return False
         sutunlar.sort(key=_donem_anahtari_ic)
         son_sutun = sutunlar[-1]
+
+        # --- YENİ: TAZELİK KONTROLÜ ---
+        # Sadece "son sütunun verisi dolu mu" değil, "bu gerçekten olması
+        # gereken en güncel çeyrek mi" diye de kontrol ediyoruz. isyatirim
+        # bazen en güncel çeyreği (örn. 2026/3) SÜTUN OLARAK HİÇ döndürmüyor
+        # (null değil, tamamen yok) — eski kontrol bunu yakalayamıyordu,
+        # çünkü elindeki (daha eski) son sütunun verisi zaten doluydu.
+        beklenen = _beklenen_min_donem()
+        if beklenen != (0, 0) and _donem_anahtari_ic(son_sutun) < beklenen:
+            return False
+
         seri = kontrol_df[kontrol_df['FINANCIAL_ITEM_CODE'] == '3L']
         if seri.empty:
             return False
@@ -283,7 +315,7 @@ def get_bist_data(hisse_kodu):
     # pes etmek yerine kısa bir bekleme ile 3 kez deniyoruz — çoğu zaman
     # ikinci veya üçüncü denemede sunucu tam/eksiksiz cevap veriyor.
     df = None
-    MAX_DENEME = 2
+    MAX_DENEME = 3
     for deneme in range(1, MAX_DENEME + 1):
         try:
             aday_df = isyatirimhisse.FetchFinancials.fetch_financials(
@@ -939,4 +971,15 @@ def handle_hesapla(message):
         bot.reply_to(message, f"❌ Hata: {str(e)}")
 
 print("🤖 Borsa Botu başarıyla başlatıldı. Telegram mesajları bekleniyor...")
+# --- YENİ: Başlamadan önce eski/takılı kalmış bağlantıları temizle ---
+# "Conflict: terminated by other getUpdates request" hatası genelde eski
+# bir oturumun (redeploy sırasında düzgün kapanmamış önceki instance,
+# webhook kalıntısı vb.) hâlâ Telegram'a bağlı olmasından kaynaklanır.
+# remove_webhook() + drop_pending_updates, başlamadan önce bunu temizler.
+try:
+    bot.remove_webhook()
+    time.sleep(1)
+except Exception as e:
+    print(f"⚠️ remove_webhook sırasında hata (görmezden gelinebilir): {e}")
+
 bot.infinity_polling()
