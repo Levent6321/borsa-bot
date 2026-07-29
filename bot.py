@@ -15,7 +15,7 @@ import socket
 # socket.setdefaulttimeout() global bir taban değer koyar; kütüphane
 # açıkça daha kısa bir timeout vermediği sürece bu devreye girer ve
 # isteklerin daha uzun süre beklemesine izin verir.
-socket.setdefaulttimeout(30)
+socket.setdefaulttimeout(15)
 
 # --- BOT AYARLARI ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -203,12 +203,33 @@ def get_bist_data(hisse_kodu):
     # ayrı ayrı ölçüyoruz. Bu print'ler Railway loglarında görünür.
     _t0 = time.time()
 
+    # --- DÜZELTME: FİYAT ÇEKME ARTIK TUTARLI ---
+    # Eskiden: önce fast_info denenir, o boşsa history()'e düşülürdü.
+    # Sorun: fast_info Yahoo'nun BIST hisselerinde bazen ESKİ/önbelleklenmiş
+    # bir değer döndürüyor (None olmadığı için history() denemesine hiç
+    # geçilmiyordu), bu da aynı hisse için art arda yapılan çağrılarda
+    # FARKLI fiyatlar görülmesine yol açıyordu. Artık her zaman history()'i
+    # (son kapanış/gün içi son fiyat) birincil kaynak olarak kullanıyoruz —
+    # bu, fast_info'ya göre çok daha stabil/tutarlı davranıyor. fast_info
+    # sadece history() de başarısız olursa yedek olarak deneniyor.
     ticker = yf.Ticker(hisse_kodu + ".IS")
-    guncel_fiyat = ticker.fast_info['lastPrice']
-    if guncel_fiyat is None:
+    guncel_fiyat = None
+    try:
         hist = ticker.history(period="1d")
-        guncel_fiyat = hist['Close'].iloc[-1]
-    print(f"⏱️ [{hisse_kodu}] fast_info/history: {time.time() - _t0:.2f}s")
+        if hist is not None and not hist.empty:
+            guncel_fiyat = float(hist['Close'].iloc[-1])
+    except Exception as e:
+        print(f"⚠️ [{hisse_kodu}] history() başarısız: {e}")
+
+    if guncel_fiyat is None:
+        try:
+            fi = ticker.fast_info['lastPrice']
+            if fi is not None:
+                guncel_fiyat = float(fi)
+        except Exception as e:
+            print(f"⚠️ [{hisse_kodu}] fast_info yedek deneme de başarısız: {e}")
+
+    print(f"⏱️ [{hisse_kodu}] fiyat çekme: {time.time() - _t0:.2f}s (sonuç: {guncel_fiyat})")
 
     _t1 = time.time()
     try:
@@ -262,7 +283,7 @@ def get_bist_data(hisse_kodu):
     # pes etmek yerine kısa bir bekleme ile 3 kez deniyoruz — çoğu zaman
     # ikinci veya üçüncü denemede sunucu tam/eksiksiz cevap veriyor.
     df = None
-    MAX_DENEME = 3
+    MAX_DENEME = 2
     for deneme in range(1, MAX_DENEME + 1):
         try:
             aday_df = isyatirimhisse.FetchFinancials.fetch_financials(
