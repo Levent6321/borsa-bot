@@ -290,12 +290,7 @@ def get_bist_data(hisse_kodu):
         sutunlar.sort(key=_donem_anahtari_ic)
         son_sutun = sutunlar[-1]
 
-        # --- YENİ: TAZELİK KONTROLÜ ---
-        # Sadece "son sütunun verisi dolu mu" değil, "bu gerçekten olması
-        # gereken en güncel çeyrek mi" diye de kontrol ediyoruz. isyatirim
-        # bazen en güncel çeyreği (örn. 2026/3) SÜTUN OLARAK HİÇ döndürmüyor
-        # (null değil, tamamen yok) — eski kontrol bunu yakalayamıyordu,
-        # çünkü elindeki (daha eski) son sütunun verisi zaten doluydu.
+        # --- TAZELİK KONTROLÜ: en güncel çeyrek gerçekten geldi mi? ---
         beklenen = _beklenen_min_donem()
         if beklenen != (0, 0) and _donem_anahtari_ic(son_sutun) < beklenen:
             return False
@@ -305,9 +300,35 @@ def get_bist_data(hisse_kodu):
             return False
         try:
             deger = seri[son_sutun].values[0]
-            return deger is not None and str(deger).strip() not in ('', 'nan', 'None')
+            if deger is None or str(deger).strip() in ('', 'nan', 'None'):
+                return False
         except Exception:
             return False
+
+        # --- YENİ: TTM GEÇMİŞ YIL KONTROLÜ ---
+        # Sadece en güncel çeyreğin gelmesi yetmiyor — TTM hesaplaması
+        # (Bu yıl + Geçen yılın tamamı - Geçen yılın aynı dönemi) için
+        # geçmiş yıl verilerinin de eksiksiz gelmesi gerekiyor. Bu kontrol
+        # olmadan, isyatirim geçmiş yıl verisini eksik döndürdüğünde kod
+        # bunu "tamam" sanıyor ve sessizce kaba ×4 yöntemine düşüyordu —
+        # bu da aynı hisse için farklı zamanlarda FARKLI (bazen gerçek TTM,
+        # bazen kaba tahmin) sonuçlar çıkmasının asıl sebebiydi.
+        yil_donem, ay_donem = _donem_anahtari_ic(son_sutun)
+        if ay_donem != 12 and ay_donem != 0:  # yıllık değilse TTM'ye ihtiyaç var
+            onceki_tam_yil_kolon = f"{yil_donem - 1}/12"
+            ayni_donem_gecen_yil_kolon = f"{yil_donem - 1}/{ay_donem}"
+            if onceki_tam_yil_kolon not in sutunlar or ayni_donem_gecen_yil_kolon not in sutunlar:
+                return False  # geçmiş yıl sütunları hiç yok, eksik say
+            try:
+                onceki_deger = seri[onceki_tam_yil_kolon].values[0]
+                ayni_donem_deger = seri[ayni_donem_gecen_yil_kolon].values[0]
+                if (onceki_deger is None or str(onceki_deger).strip() in ('', 'nan', 'None') or
+                        ayni_donem_deger is None or str(ayni_donem_deger).strip() in ('', 'nan', 'None')):
+                    return False
+            except Exception:
+                return False
+
+        return True
 
     # --- RETRY MANTIĞI ---
     # isyatirim.com.tr sunucusu bazen geçici olarak yavaşlıyor/zaman aşımına
