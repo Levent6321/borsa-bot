@@ -1028,15 +1028,24 @@ def handle_hesapla(message):
         bot.reply_to(message, f"❌ Hata: {str(e)}")
 
 print("🤖 Borsa Botu başarıyla başlatıldı. Telegram mesajları bekleniyor...")
-# --- YENİ: Başlamadan önce eski/takılı kalmış bağlantıları temizle ---
-# "Conflict: terminated by other getUpdates request" hatası genelde eski
-# bir oturumun (redeploy sırasında düzgün kapanmamış önceki instance,
-# webhook kalıntısı vb.) hâlâ Telegram'a bağlı olmasından kaynaklanır.
-# remove_webhook() + drop_pending_updates, başlamadan önce bunu temizler.
-try:
-    bot.remove_webhook()
-    time.sleep(1)
-except Exception as e:
-    print(f"⚠️ remove_webhook sırasında hata (görmezden gelinebilir): {e}")
 
-bot.infinity_polling()
+# --- YENİ: KENDİNİ İYİLEŞTİREN BAŞLATMA DÖNGÜSÜ ---
+# Sorun: bot.infinity_polling(), 409 "Conflict" hatası (genelde redeploy
+# sırasında eski konteynerin tam kapanmadan yeni konteynerin başlamasından
+# kaynaklanan geçici bir çakışma) aldığında SESSİZCE devam etmiyor,
+# hatayı fırlatıp TÜM SÜRECİ ÇÖKERTİYORDU. Bu da Railway'in botu manuel
+# yeniden başlatmasını gerektiriyordu. Artık bunu dıştan bir döngüyle
+# sarmalıyoruz: çökerse birkaç saniye bekleyip KENDİSİ tekrar dener,
+# Railway'in ayrıca müdahale etmesine gerek kalmaz.
+while True:
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except Exception as e:
+        print(f"⚠️ remove_webhook sırasında hata (görmezden gelinebilir): {e}")
+
+    try:
+        bot.infinity_polling()
+    except Exception as e:
+        print(f"🔴 Bot çöktü: {e}. 10 saniye bekleyip yeniden başlatılıyor...")
+        time.sleep(10)
