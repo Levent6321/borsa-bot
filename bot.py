@@ -364,7 +364,7 @@ def get_bist_data(hisse_kodu):
     # pes etmek yerine kısa bir bekleme ile 3 kez deniyoruz — çoğu zaman
     # ikinci veya üçüncü denemede sunucu tam/eksiksiz cevap veriyor.
     df = None
-    MAX_DENEME = 3
+    MAX_DENEME = 4
     for deneme in range(1, MAX_DENEME + 1):
         try:
             aday_df = isyatirimhisse.FetchFinancials.fetch_financials(
