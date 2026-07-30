@@ -256,6 +256,21 @@ def get_bist_data(hisse_kodu):
         except Exception:
             return (0, 0)
 
+    def _kolon_bul(hedef_str, kolonlar):
+        """
+        Elle oluşturulan bir sütun ismini ('2025/12' gibi bir Python string'i)
+        gerçek DataFrame sütunlarıyla eşleştirir. Doğrudan '==' karşılaştırması
+        bazen sessizce başarısız oluyordu (sütunlar görünüşte aynı yazsa da
+        farklı bir iç veri tipinde olabiliyor) — bu yüzden str() çevrimiyle
+        karşılaştırıyoruz, tipten bağımsız hale getiriyoruz. TTM hesabının
+        THYAO'da sürekli "geçmiş yıl bulunamadı"ya düşmesinin asıl sebebi
+        tam olarak buydu.
+        """
+        for c in kolonlar:
+            if str(c) == str(hedef_str):
+                return c
+        return None
+
     def _beklenen_min_donem():
         """
         Bugünün tarihine göre, BIST'te en geç yayınlanmış olması GEREKEN
@@ -315,9 +330,9 @@ def get_bist_data(hisse_kodu):
         # bazen kaba tahmin) sonuçlar çıkmasının asıl sebebiydi.
         yil_donem, ay_donem = _donem_anahtari_ic(son_sutun)
         if ay_donem != 12 and ay_donem != 0:  # yıllık değilse TTM'ye ihtiyaç var
-            onceki_tam_yil_kolon = f"{yil_donem - 1}/12"
-            ayni_donem_gecen_yil_kolon = f"{yil_donem - 1}/{ay_donem}"
-            if onceki_tam_yil_kolon not in sutunlar or ayni_donem_gecen_yil_kolon not in sutunlar:
+            onceki_tam_yil_kolon = _kolon_bul(f"{yil_donem - 1}/12", sutunlar)
+            ayni_donem_gecen_yil_kolon = _kolon_bul(f"{yil_donem - 1}/{ay_donem}", sutunlar)
+            if onceki_tam_yil_kolon is None or ayni_donem_gecen_yil_kolon is None:
                 return False  # geçmiş yıl sütunları hiç yok, eksik say
             try:
                 onceki_deger = seri[onceki_tam_yil_kolon].values[0]
@@ -436,13 +451,16 @@ def get_bist_data(hisse_kodu):
         ay_sayisi = 12
 
     def item_deger(kod, kolon):
-        if kolon is None or kolon not in df.columns:
+        if kolon is None:
+            return None
+        gercek_kolon = kolon if kolon in df.columns else _kolon_bul(kolon, df.columns)
+        if gercek_kolon is None:
             return None
         seri = df[df['FINANCIAL_ITEM_CODE'] == kod]
         if seri.empty:
             return None
         try:
-            return temizle(seri[kolon].values[0])
+            return temizle(seri[gercek_kolon].values[0])
         except Exception:
             return None
 
