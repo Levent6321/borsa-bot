@@ -294,6 +294,7 @@ def get_bist_data(hisse_kodu):
 
     def _veri_butun_mu(kontrol_df):
         if kontrol_df is None or kontrol_df.empty:
+            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: DataFrame boş/None")
             return False
         sutunlar = [
             c for c in kontrol_df.columns
@@ -301,23 +302,29 @@ def get_bist_data(hisse_kodu):
             and "/" in str(c)
         ]
         if not sutunlar:
+            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: hiç dönem sütunu bulunamadı. Ham sütunlar: {list(kontrol_df.columns)}")
             return False
         sutunlar.sort(key=_donem_anahtari_ic)
         son_sutun = sutunlar[-1]
+        print(f"🔎 [{hisse_kodu}] _veri_butun_mu: bulunan dönem sütunları: {[str(s) for s in sutunlar]}, son_sutun: {son_sutun} (tip: {type(son_sutun)})")
 
         # --- TAZELİK KONTROLÜ: en güncel çeyrek gerçekten geldi mi? ---
         beklenen = _beklenen_min_donem()
         if beklenen != (0, 0) and _donem_anahtari_ic(son_sutun) < beklenen:
+            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TAZELİK başarısız — son_sutun={_donem_anahtari_ic(son_sutun)}, beklenen={beklenen}")
             return False
 
         seri = kontrol_df[kontrol_df['FINANCIAL_ITEM_CODE'] == '3L']
         if seri.empty:
+            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: FINANCIAL_ITEM_CODE=='3L' satırı hiç yok")
             return False
         try:
             deger = seri[son_sutun].values[0]
             if deger is None or str(deger).strip() in ('', 'nan', 'None'):
+                print(f"🔴 [{hisse_kodu}] _veri_butun_mu: son_sutun ({son_sutun}) için 3L değeri boş/None: {deger!r}")
                 return False
-        except Exception:
+        except Exception as e:
+            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: son_sutun okurken hata: {e}")
             return False
 
         # --- YENİ: TTM GEÇMİŞ YIL KONTROLÜ ---
@@ -332,17 +339,23 @@ def get_bist_data(hisse_kodu):
         if ay_donem != 12 and ay_donem != 0:  # yıllık değilse TTM'ye ihtiyaç var
             onceki_tam_yil_kolon = _kolon_bul(f"{yil_donem - 1}/12", sutunlar)
             ayni_donem_gecen_yil_kolon = _kolon_bul(f"{yil_donem - 1}/{ay_donem}", sutunlar)
+            print(f"🔎 [{hisse_kodu}] TTM arıyor: aranan='{yil_donem-1}/12' bulunan={onceki_tam_yil_kolon!r} | aranan='{yil_donem-1}/{ay_donem}' bulunan={ayni_donem_gecen_yil_kolon!r}")
             if onceki_tam_yil_kolon is None or ayni_donem_gecen_yil_kolon is None:
+                print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TTM için geçmiş yıl sütunları bulunamadı")
                 return False  # geçmiş yıl sütunları hiç yok, eksik say
             try:
                 onceki_deger = seri[onceki_tam_yil_kolon].values[0]
                 ayni_donem_deger = seri[ayni_donem_gecen_yil_kolon].values[0]
+                print(f"🔎 [{hisse_kodu}] TTM geçmiş yıl değerleri: onceki_tam={onceki_deger!r}, ayni_donem={ayni_donem_deger!r}")
                 if (onceki_deger is None or str(onceki_deger).strip() in ('', 'nan', 'None') or
                         ayni_donem_deger is None or str(ayni_donem_deger).strip() in ('', 'nan', 'None')):
+                    print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TTM geçmiş yıl değerleri boş/None")
                     return False
-            except Exception:
+            except Exception as e:
+                print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TTM geçmiş yıl okurken hata: {e}")
                 return False
 
+        print(f"🟢 [{hisse_kodu}] _veri_butun_mu: TÜM KONTROLLER GEÇTİ, veri tam kabul edildi (son_sutun={son_sutun})")
         return True
 
     # --- RETRY MANTIĞI ---
@@ -467,6 +480,7 @@ def get_bist_data(hisse_kodu):
     def ttm_hesapla(kod):
         guncel = item_deger(kod, latest_col)
         if guncel is None:
+            print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): latest_col ({latest_col}) için değer bulunamadı")
             return 0.0, False
         if ay_sayisi == 12 or yil is None:
             return guncel, True  # zaten yıllık veri
@@ -476,7 +490,9 @@ def get_bist_data(hisse_kodu):
         ayni_donem_gecen_yil_kolon = f"{yil - 1}/{ay_sayisi}"
         onceki_tam = item_deger(kod, onceki_tam_yil_kolon)
         ayni_donem = item_deger(kod, ayni_donem_gecen_yil_kolon)
+        print(f"🔎 [{hisse_kodu}] ttm_hesapla({kod}) 1.deneme: guncel={guncel}, onceki_tam({onceki_tam_yil_kolon})={onceki_tam}, ayni_donem({ayni_donem_gecen_yil_kolon})={ayni_donem}")
         if onceki_tam is not None and ayni_donem is not None:
+            print(f"🟢 [{hisse_kodu}] ttm_hesapla({kod}): GERÇEK TTM hesaplandı (isim eşleşmesi) = {guncel + onceki_tam - ayni_donem}")
             return guncel + onceki_tam - ayni_donem, True  # gerçek TTM
 
         # 2. Deneme: isim eşleşmesi başarısız olursa, POZİSYONA
@@ -497,12 +513,14 @@ def get_bist_data(hisse_kodu):
                     onceki_tam_poz = item_deger(kod, onceki_tam_kolon_poz)
                     ayni_donem_poz = item_deger(kod, ayni_donem_kolon_poz)
                     if onceki_tam_poz is not None and ayni_donem_poz is not None:
+                        print(f"🟢 [{hisse_kodu}] ttm_hesapla({kod}): GERÇEK TTM hesaplandı (pozisyon eşleşmesi)")
                         return guncel + onceki_tam_poz - ayni_donem_poz, True
-        except (ValueError, IndexError):
-            pass
+        except (ValueError, IndexError) as e:
+            print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): pozisyon denemesi hata: {e}")
 
         # 3. Son çare: geçmiş yıl verisi hiçbir şekilde bulunamadı
         # (örn. yeni halka arz), kaba yıllıklandırmaya düş
+        print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): HER İKİ DENEME DE BAŞARISIZ, kaba ×{12/ay_sayisi if ay_sayisi else 1:.2f} kullanılıyor")
         carpan = 12 / ay_sayisi if ay_sayisi else 1
         return guncel * carpan, False
 
