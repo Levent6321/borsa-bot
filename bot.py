@@ -585,7 +585,7 @@ def get_bist_data(hisse_kodu):
             # Zaten 6 aylık dönemdeysek mevcut kümülatif değer budur
             net_kar_6ay = item_deger('3L', latest_col)
 
-    return {
+    sonuc = {
         'fiyat': round(guncel_fiyat, 2),
         'hbdd': ozsermaye / toplam_hisse if toplam_hisse > 0 else 0,
         'hbk': net_kar / toplam_hisse if toplam_hisse > 0 else 0,
@@ -611,6 +611,20 @@ def get_bist_data(hisse_kodu):
         'piyasa': 'BIST',
         'para_birimi': 'TL',
     }
+
+    # --- DÜZELTME: ÖNBELLEĞE YAZMA EKLENDİ ---
+    # Eskiden _GUNLUK_ONBELLEK sadece OKUNUYOR, hiçbir yerde YAZILMIYORDU
+    # (bkz. yukarıdaki 223. satır) — bu yüzden önbellek fiilen hiç devreye
+    # girmiyor, her çağrı isyatirim'e yeniden gidiyor ve o anki sunucu
+    # yanıt kalitesine göre (gerçek TTM / eksik veri / kaba yıllıklandırma)
+    # FARKLI sonuçlar üretebiliyordu. Sadece GERÇEK TTM ile başarılı olan
+    # sonuçlar önbelleğe yazılıyor; kaba tahminle bitenler yazılmıyor ki
+    # bir sonraki sorguda isyatirim toparlanırsa gerçek veriyi yakalama
+    # şansı kalsın.
+    if ttm_gercek:
+        _GUNLUK_ONBELLEK[onbellek_anahtar] = dict(sonuc)
+
+    return sonuc
 
 
 # --- 1b. ABD BORSASI VERİ ÇEKME (sadece yfinance ile) ---
