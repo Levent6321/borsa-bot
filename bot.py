@@ -188,6 +188,23 @@ def format_para(deger, para_birimi="TL"):
         return f"{deger:,.2f}"
 
 
+# --- YENİ: GÜNLÜK ÖNBELLEK (CACHE) ---
+# Amaç: Aynı hisse için aynı gün içinde tekrar sorulduğunda TUTARLI sonuç
+# vermek. isyatirim bazen tam veri (gerçek TTM) döndürüyor, bazen zaman
+# aşımına uğrayıp kaba tahmine düşülüyordu — bu da aynı hisse için farklı
+# sorgularda FARKLI sonuçlar çıkmasına yol açıyordu.
+# Mantık: Sadece GERÇEK TTM ile başarılı olan sonuçlar önbelleğe alınır
+# (ttm_gercek=True). Kaba tahminle biten sonuçlar önbelleğe ALINMAZ —
+# böylece isyatirim daha sonra toparlanırsa, bir sonraki sorguda yine
+# gerçek veriyi yakalama şansı kalır. Fiyat her zaman canlı çekilir,
+# sadece bilanço/gelir tablosu kalemleri önbelleklenir.
+_GUNLUK_ONBELLEK = {}
+
+
+def _onbellek_anahtari(hisse_kodu):
+    return (hisse_kodu, date.today().isoformat())
+
+
 # --- 1a. BIST VERİ ÇEKME (isyatirimhisse ile) ---
 def get_bist_data(hisse_kodu):
     if hisse_kodu in BANKALAR:
@@ -197,6 +214,23 @@ def get_bist_data(hisse_kodu):
             f"analizini desteklemiyor. Yanlış kalem eşleşmesiyle hatalı "
             f"sonuç üretmektense bu özelliği henüz devre dışı bıraktık."
         )}
+
+    # --- YENİ: ÖNBELLEK KONTROLÜ ---
+    # Bugün bu hisse için daha önce GERÇEK TTM ile başarılı bir sonuç
+    # alındıysa, isyatirim'e tekrar gitmeden onu kullan. Sadece fiyatı
+    # canlı güncelle (fiyat her an değişebilir, bilanço günlük değişmez).
+    onbellek_anahtar = _onbellek_anahtari(hisse_kodu)
+    if onbellek_anahtar in _GUNLUK_ONBELLEK:
+        onbellek_veri = dict(_GUNLUK_ONBELLEK[onbellek_anahtar])  # kopya al
+        print(f"💾 [{hisse_kodu}] Önbellekten kullanılıyor (bugün zaten gerçek TTM ile çekilmişti)")
+        try:
+            ticker_fiyat = yf.Ticker(hisse_kodu + ".IS")
+            hist = ticker_fiyat.history(period="1d")
+            if hist is not None and not hist.empty:
+                onbellek_veri['fiyat'] = round(float(hist['Close'].iloc[-1]), 2)
+        except Exception as e:
+            print(f"⚠️ [{hisse_kodu}] Önbellek fiyat güncellemesi başarısız, eski fiyat kullanılıyor: {e}")
+        return onbellek_veri
 
     # --- YENİ: ZAMANLAMA ÖLÇÜMÜ ---
     # Hangi ağ çağrısının yavaşlığa sebep olduğunu görmek için her adımı
