@@ -564,7 +564,13 @@ def get_bist_data(hisse_kodu):
     hasilat, hasilat_ttm_gercek = ttm_hesapla('3C')
     satislarin_maliyeti_ham, cogs_ttm_gercek = ttm_hesapla('3CA')
     satislarin_maliyeti = abs(satislarin_maliyeti_ham)  # "(-)" işaretli kalem, mutlak değer alınıyor
-    ttm_gercek = net_kar_ttm_gercek and favok_ttm_gercek
+    # --- DÜZELTME: Rapor notu artık SADECE net kârın gerçek TTM olup
+    # olmadığına bakıyor. Eskiden FAVÖK de başarısız olursa (örn. THYAO
+    # gibi FAVÖK kalemi olmayan/farklı yapıdaki şirketlerde) not yanlışlıkla
+    # "kaba tahmin" diyordu — net kâr gerçekten doğru hesaplanmış olsa bile.
+    # HBK/Graham/Peter Lynch zaten sadece net kâra dayandığı için, notun da
+    # net kârın durumunu yansıtması daha doğru.
+    ttm_gercek = net_kar_ttm_gercek
     yillik_carpan = 12 / ay_sayisi if ay_sayisi and ay_sayisi < 12 else 1
 
     # --- Future F/K formülü için gerçek 6 aylık (H1) net kâr ---
@@ -868,7 +874,10 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     rapor += f"**🔮 BİLANÇO BAZLI ADİL DEĞERLER:**\n"
     rapor += f"🔹 Graham Değeri: {tl(graham)} {sembol}\n"
     rapor += f"🔹 PD/DD Bazlı Hedef: {tl(hedef_pddd)} {sembol}\n"
-    rapor += f"🔹 FD/FAVÖK Bazlı Hedef: {tl(hedef_fd_favok)} {sembol}\n"
+    if hedef_fd_favok > 0:
+        rapor += f"🔹 FD/FAVÖK Bazlı Hedef: {tl(hedef_fd_favok)} {sembol}\n"
+    else:
+        rapor += f"🔹 FD/FAVÖK Bazlı Hedef: N/A _(bu şirket için FAVÖK verisi bulunamadı)_\n"
     rapor += f"---\n\n"
 
     rapor += f"**📈 BÜYÜME VE KÂRLILIK BAZLI ADİL DEĞERLER:**\n"
