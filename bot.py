@@ -257,7 +257,7 @@ def _onbellek_oku(anahtar):
 def _onbellek_yaz(anahtar, veri):
     if _redis_client:
         try:
-            _redis_client.setex(anahtar, _ONBELLEK_TTL_SANIYE, json.dumps(veri))
+            _redis_client.set(anahtar, json.dumps(veri), ex=_ONBELLEK_TTL_SANIYE)
             return
         except Exception as e:
             print(f"⚠️ Redis yazma hatası ({anahtar}): {e}, bellek-içi yedeğe yazılıyor")
