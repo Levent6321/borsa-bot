@@ -28,12 +28,6 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # --- BANKA/FİNANS KURULUŞU LİSTESİ (sadece BIST için) ---
-# NOT: TKFEN (Tekfen Holding) buradan çıkarıldı — o bir banka değil,
-# inşaat/tarım ağırlıklı bir holding. Yanlışlıkla bankalar listesindeydi
-# ve gereksiz yere Graham/DCF hesaplarından dışlanıyordu.
-# KTLEV (Katılımevim Tasarruf Finansman) eklendi — BDDK lisanslı bir
-# finansman şirketi, bankalarla aynı sebepten (farklı bilanço formatı,
-# FD/FAVÖK gibi oranlar anlamsız) burada tutuluyor.
 BANKALAR = ["AKBNK", "GARAN", "YKBNK", "ISCTR", "VAKBN", "HALKB", "SKBNK", "KTLEV"]
 
 # --- DCF VARSAYIMLARI ---
@@ -48,7 +42,6 @@ GORDON_ISKONTO_ORANI = 0.30
 
 
 def cari_oran_yorum(deger):
-    """Cari Oran: kısa vadeli borç ödeme gücü. İdeal aralık 1,5-2,5."""
     if deger <= 0:
         return "veri yok"
     if 1.5 <= deger <= 2.5:
@@ -60,7 +53,6 @@ def cari_oran_yorum(deger):
 
 
 def kaldirac_yorum(yuzde):
-    """Kaldıraç Oranı (Toplam Borç/Toplam Varlık %): kaynağa göre ≤%50 istenir."""
     if yuzde <= 0:
         return "veri yok"
     if yuzde <= 50:
@@ -70,18 +62,6 @@ def kaldirac_yorum(yuzde):
     else:
         return "Riskli"
 
-# --- SEKTÖR/EMSAL GRUPLARI (gerçek BIST piyasa değeri verisiyle güncellendi) ---
-# Her grup, o sektördeki en büyük (en likit) piyasa değerine sahip hisselerden
-# seçildi — performans için grup başına ~5-8 hisseyle sınırlı tutuldu.
-# NOT: GYO (Gayrimenkul Yatırım Ortaklığı) şirketleri gelirlerini gayrimenkul
-# yeniden değerleme kazançlarından da elde ettiği için Graham/Peter Lynch gibi
-# kâr-bazlı formüllerde diğer sektörlere göre daha az güvenilir olabilir.
-#
-# NOT (DEVRE DIŞI BIRAKILDI): Bu grup tanımları hâlâ burada duruyor çünkü
-# sektor_ortalama_carpanlar() fonksiyonu kod tabanından silinmedi — sadece
-# çağrılmıyor (bkz. hesapla_ve_rapor_ver içindeki "sektor_bilgi = None").
-# İleride zaman-bazlı bir cache eklenirse tek satır değiştirilerek geri
-# açılabilir.
 SEKTOR_GRUPLARI = {
     "Otomotiv": ["FROTO", "TOASO", "DOAS", "OTKAR", "BRISA"],
     "Demir-Çelik": ["EREGL", "ISDMR", "BRSAN", "KRDMD", "KRDMA", "KRDMB"],
@@ -111,27 +91,6 @@ def hissenin_sektoru(hisse_kodu):
 
 
 def sektor_ortalama_carpanlar(hisse_kodu):
-    """
-    Aynı sektördeki diğer hisselerin F/K ve PD/DD medyanını hesaplar.
-    NOT: Sadece 2-5 hisselik küçük gruplar olduğu için istatistiksel
-    olarak "kesin" bir sektör ortalaması değil, kaba bir emsal kıyaslaması.
-    Ortalamaya (Genel Ortalama Adil Değer'e) dahil edilmez, sadece bağlam
-    sağlamak için deneysel bölümde gösterilir.
-
-    NOT: Bu fonksiyon şu an çağrılmıyor (bkz. hesapla_ve_rapor_ver içindeki
-    "sektor_bilgi = None" satırı). Sebep: her çağrıda 4-8 emsal hisseyi
-    ayrı ayrı çekmek (isyatirim + yfinance), tek bir /hesapla komutunu
-    5+ hissenin verisini çekmeye dönüştürüp ciddi yavaşlığa ve rate-limit
-    riskine yol açıyordu. Fonksiyon ileride bir cache mekanizmasıyla
-    birlikte tekrar devreye alınabilir diye silinmedi.
-
-    DÜZELTME: Aritmetik ortalama yerine MEDYAN kullanılıyor ve aşırı uçuk
-    F/K (>60) ile PD/DD (>10) değerleri filtreleniyor. Sebep: küçük emsal
-    gruplarında (özellikle sektörün geneli düşük kârlılık yaşadığında) tek
-    bir aşırı yüksek F/K'lı hisse, ortalamayı anlamsız şekilde şişirebiliyor
-    (örn. EREGL testinde "Sektör Ort. F/K: 171" gibi gerçekçi olmayan bir
-    sonuç çıkmıştı — medyan ve filtre bunu büyük ölçüde engeller).
-    """
     sektor, emsaller = hissenin_sektoru(hisse_kodu)
     if sektor is None:
         return None
@@ -178,39 +137,17 @@ def sektor_ortalama_carpanlar(hisse_kodu):
         'emsal_sayisi': len(emsaller) - 1,
         'ort_fk': medyan(fk_listesi) if fk_listesi else None,
         'ort_pddd': medyan(pddd_listesi) if pddd_listesi else None,
-        'kullanilan_emsal_sayisi': len(fk_listesi),  # filtre sonrası kaç hisse gerçekten kullanıldı
+        'kullanilan_emsal_sayisi': len(fk_listesi),
     }
 
 
 def format_para(deger, para_birimi="TL"):
-    """TL için Türk formatı (1.234,56), USD için standart format (1,234.56)."""
     if para_birimi == "TL":
         return f"{deger:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     else:
         return f"{deger:,.2f}"
 
 
-# --- GÜNLÜK ÖNBELLEK (CACHE) — artık Redis tabanlı ve KALICI ---
-# Amaç: Aynı hisse için aynı gün içinde tekrar sorulduğunda TUTARLI sonuç
-# vermek. isyatirim bazen tam veri (gerçek TTM) döndürüyor, bazen zaman
-# aşımına uğrayıp kaba tahmine düşülüyordu — bu da aynı hisse için farklı
-# sorgularda FARKLI sonuçlar çıkmasına yol açıyordu.
-# Mantık: Sadece GERÇEK TTM ile başarılı olan sonuçlar önbelleğe alınır
-# (ttm_gercek=True). Kaba tahminle biten sonuçlar önbelleğe ALINMAZ —
-# böylece isyatirim daha sonra toparlanırsa, bir sonraki sorguda yine
-# gerçek veriyi yakalama şansı kalır. Fiyat her zaman canlı çekilir,
-# sadece bilanço/gelir tablosu kalemleri önbelleklenir.
-#
-# DÜZELTME: Eskiden bu, sürecin kendi belleğindeki sıradan bir Python
-# sözlüğüydü (_GUNLUK_ONBELLEK = {}) — Railway her redeploy/restart
-# yaptığında (crash sonrası kendi kendine yeniden başlatma dahil) bu
-# sözlük sıfırlanıyor, "kalıcı" olması gereken önbellek aslında hiç
-# kalıcı olmuyordu. Artık Railway'in sağladığı REDIS_URL ortam
-# değişkeni üzerinden ayrı bir Redis servisine yazılıyor — bot yeniden
-# başlasa bile önbellek verisi Redis'te kalmaya devam ediyor.
-# Redis'e her nedenle ulaşılamazsa (env değişkeni eksik, bağlantı
-# hatası vb.) kod BOZULMUYOR — sessizce eski bellek-içi sözlüğe
-# düşüyor, bot çökmeden çalışmaya devam ediyor.
 REDIS_URL = os.environ.get("REDIS_URL")
 _redis_client = None
 if REDIS_URL:
@@ -227,17 +164,12 @@ if REDIS_URL:
 else:
     print("⚠️ REDIS_URL ortam değişkeni bulunamadı, bellek-içi (geçici) önbellek kullanılacak.")
 
-# Redis yoksa/erişilemezse bot yine de çalışsın diye yedek bellek-içi sözlük
 _GUNLUK_ONBELLEK_YEDEK = {}
 
-# Önbellek kaydının Redis'te ne kadar süre tutulacağı (saniye).
-# 26 saat: "günlük" mantığa 2 saatlik güvenlik payı eklendi (sunucu
-# saat dilimi kaymaları / gece yarısı sınır durumları için).
 _ONBELLEK_TTL_SANIYE = 26 * 60 * 60
 
 
 def _onbellek_anahtari(hisse_kodu):
-    # Redis anahtarları string olmalı (eskiden tuple kullanılıyordu).
     return f"bist_bot:{hisse_kodu}:{date.today().isoformat()}"
 
 
@@ -250,21 +182,20 @@ def _onbellek_oku(anahtar):
             return None
         except Exception as e:
             print(f"⚠️ Redis okuma hatası ({anahtar}): {e}")
-            # Redis'e ulaşılamadıysa yedek sözlüğe bak
     return _GUNLUK_ONBELLEK_YEDEK.get(anahtar)
 
 
 def _onbellek_yaz(anahtar, veri):
+    # DÜZELTME: deprecated setex() yerine set(..., ex=...) kullanılıyor.
     if _redis_client:
         try:
-            _redis_client.setex(anahtar, _ONBELLEK_TTL_SANIYE, json.dumps(veri))
+            _redis_client.set(anahtar, json.dumps(veri), ex=_ONBELLEK_TTL_SANIYE)
             return
         except Exception as e:
             print(f"⚠️ Redis yazma hatası ({anahtar}): {e}, bellek-içi yedeğe yazılıyor")
     _GUNLUK_ONBELLEK_YEDEK[anahtar] = veri
 
 
-# --- 1a. BIST VERİ ÇEKME (isyatirimhisse ile) ---
 def get_bist_data(hisse_kodu):
     if hisse_kodu in BANKALAR:
         return {"hata": (
@@ -274,14 +205,10 @@ def get_bist_data(hisse_kodu):
             f"sonuç üretmektense bu özelliği henüz devre dışı bıraktık."
         )}
 
-    # --- YENİ: ÖNBELLEK KONTROLÜ ---
-    # Bugün bu hisse için daha önce GERÇEK TTM ile başarılı bir sonuç
-    # alındıysa, isyatirim'e tekrar gitmeden onu kullan. Sadece fiyatı
-    # canlı güncelle (fiyat her an değişebilir, bilanço günlük değişmez).
     onbellek_anahtar = _onbellek_anahtari(hisse_kodu)
     onbellek_veri = _onbellek_oku(onbellek_anahtar)
     if onbellek_veri is not None:
-        onbellek_veri = dict(onbellek_veri)  # kopya al
+        onbellek_veri = dict(onbellek_veri)
         print(f"💾 [{hisse_kodu}] Önbellekten kullanılıyor (bugün zaten gerçek TTM ile çekilmişti)")
         try:
             ticker_fiyat = yf.Ticker(hisse_kodu + ".IS")
@@ -292,20 +219,8 @@ def get_bist_data(hisse_kodu):
             print(f"⚠️ [{hisse_kodu}] Önbellek fiyat güncellemesi başarısız, eski fiyat kullanılıyor: {e}")
         return onbellek_veri
 
-    # --- YENİ: ZAMANLAMA ÖLÇÜMÜ ---
-    # Hangi ağ çağrısının yavaşlığa sebep olduğunu görmek için her adımı
-    # ayrı ayrı ölçüyoruz. Bu print'ler Railway loglarında görünür.
     _t0 = time.time()
 
-    # --- DÜZELTME: FİYAT ÇEKME ARTIK TUTARLI ---
-    # Eskiden: önce fast_info denenir, o boşsa history()'e düşülürdü.
-    # Sorun: fast_info Yahoo'nun BIST hisselerinde bazen ESKİ/önbelleklenmiş
-    # bir değer döndürüyor (None olmadığı için history() denemesine hiç
-    # geçilmiyordu), bu da aynı hisse için art arda yapılan çağrılarda
-    # FARKLI fiyatlar görülmesine yol açıyordu. Artık her zaman history()'i
-    # (son kapanış/gün içi son fiyat) birincil kaynak olarak kullanıyoruz —
-    # bu, fast_info'ya göre çok daha stabil/tutarlı davranıyor. fast_info
-    # sadece history() de başarısız olursa yedek olarak deneniyor.
     ticker = yf.Ticker(hisse_kodu + ".IS")
     guncel_fiyat = None
     try:
@@ -335,14 +250,6 @@ def get_bist_data(hisse_kodu):
     _t2 = time.time()
     guncel_yil = datetime.now().year
 
-    # --- YENİ: VERİ BÜTÜNLÜĞÜ KONTROLÜ ---
-    # Sadece "df boş değil" kontrolü yeterli değildi — isyatirim bazen
-    # dolu ama EKSİK bir yanıt döndürüyor (örn. en güncel çeyrek sütunu
-    # hiç gelmemiş, veri 1-2 dönem geride kalmış). Bu durumda kod sessizce
-    # eski bir dönemi "en güncel" sanıyordu (FROTO'da aynı gün içinde
-    # 2026/3 ile 2025/12 arasında gidip gelen sonuçların asıl sebebi buydu).
-    # Bu fonksiyon, gelen yanıtta net kâr (3L) kalemi gerçekten dolu mu
-    # diye kontrol ediyor; değilse yanıtı "eksik" sayıp tekrar deniyoruz.
     def _donem_anahtari_ic(kolon):
         try:
             y, a = str(kolon).split("/")
@@ -351,28 +258,12 @@ def get_bist_data(hisse_kodu):
             return (0, 0)
 
     def _kolon_bul(hedef_str, kolonlar):
-        """
-        Elle oluşturulan bir sütun ismini ('2025/12' gibi bir Python string'i)
-        gerçek DataFrame sütunlarıyla eşleştirir. Doğrudan '==' karşılaştırması
-        bazen sessizce başarısız oluyordu (sütunlar görünüşte aynı yazsa da
-        farklı bir iç veri tipinde olabiliyor) — bu yüzden str() çevrimiyle
-        karşılaştırıyoruz, tipten bağımsız hale getiriyoruz. TTM hesabının
-        THYAO'da sürekli "geçmiş yıl bulunamadı"ya düşmesinin asıl sebebi
-        tam olarak buydu.
-        """
         for c in kolonlar:
             if str(c) == str(hedef_str):
                 return c
         return None
 
     def _beklenen_min_donem():
-        """
-        Bugünün tarihine göre, BIST'te en geç yayınlanmış olması GEREKEN
-        çeyreği hesaplar (yaklaşık 75 günlük raporlama gecikme payıyla).
-        Örnek: Bugün 29 Temmuz 2026 ise, 2026/3 (31 Mart bitişli çeyrek)
-        75 gün önce (yaklaşık 14 Haziran 2026) yayınlanmış olması
-        gerektiğinden "beklenen minimum dönem" 2026/3 olur.
-        """
         bugun = date.today()
         adaylar = []
         for yil_ad in [bugun.year, bugun.year - 1]:
@@ -402,7 +293,6 @@ def get_bist_data(hisse_kodu):
         son_sutun = sutunlar[-1]
         print(f"🔎 [{hisse_kodu}] _veri_butun_mu: bulunan dönem sütunları: {[str(s) for s in sutunlar]}, son_sutun: {son_sutun} (tip: {type(son_sutun)})")
 
-        # --- TAZELİK KONTROLÜ: en güncel çeyrek gerçekten geldi mi? ---
         beklenen = _beklenen_min_donem()
         if beklenen != (0, 0) and _donem_anahtari_ic(son_sutun) < beklenen:
             print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TAZELİK başarısız — son_sutun={_donem_anahtari_ic(son_sutun)}, beklenen={beklenen}")
@@ -421,22 +311,14 @@ def get_bist_data(hisse_kodu):
             print(f"🔴 [{hisse_kodu}] _veri_butun_mu: son_sutun okurken hata: {e}")
             return False
 
-        # --- YENİ: TTM GEÇMİŞ YIL KONTROLÜ ---
-        # Sadece en güncel çeyreğin gelmesi yetmiyor — TTM hesaplaması
-        # (Bu yıl + Geçen yılın tamamı - Geçen yılın aynı dönemi) için
-        # geçmiş yıl verilerinin de eksiksiz gelmesi gerekiyor. Bu kontrol
-        # olmadan, isyatirim geçmiş yıl verisini eksik döndürdüğünde kod
-        # bunu "tamam" sanıyor ve sessizce kaba ×4 yöntemine düşüyordu —
-        # bu da aynı hisse için farklı zamanlarda FARKLI (bazen gerçek TTM,
-        # bazen kaba tahmin) sonuçlar çıkmasının asıl sebebiydi.
         yil_donem, ay_donem = _donem_anahtari_ic(son_sutun)
-        if ay_donem != 12 and ay_donem != 0:  # yıllık değilse TTM'ye ihtiyaç var
+        if ay_donem != 12 and ay_donem != 0:
             onceki_tam_yil_kolon = _kolon_bul(f"{yil_donem - 1}/12", sutunlar)
             ayni_donem_gecen_yil_kolon = _kolon_bul(f"{yil_donem - 1}/{ay_donem}", sutunlar)
             print(f"🔎 [{hisse_kodu}] TTM arıyor: aranan='{yil_donem-1}/12' bulunan={onceki_tam_yil_kolon!r} | aranan='{yil_donem-1}/{ay_donem}' bulunan={ayni_donem_gecen_yil_kolon!r}")
             if onceki_tam_yil_kolon is None or ayni_donem_gecen_yil_kolon is None:
                 print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TTM için geçmiş yıl sütunları bulunamadı")
-                return False  # geçmiş yıl sütunları hiç yok, eksik say
+                return False
             try:
                 onceki_deger = seri[onceki_tam_yil_kolon].values[0]
                 ayni_donem_deger = seri[ayni_donem_gecen_yil_kolon].values[0]
@@ -452,11 +334,6 @@ def get_bist_data(hisse_kodu):
         print(f"🟢 [{hisse_kodu}] _veri_butun_mu: TÜM KONTROLLER GEÇTİ, veri tam kabul edildi (son_sutun={son_sutun})")
         return True
 
-    # --- RETRY MANTIĞI ---
-    # isyatirim.com.tr sunucusu bazen geçici olarak yavaşlıyor/zaman aşımına
-    # uğruyor (Railway loglarında "Read timed out" görüldü). Tek seferde
-    # pes etmek yerine kısa bir bekleme ile 3 kez deniyoruz — çoğu zaman
-    # ikinci veya üçüncü denemede sunucu tam/eksiksiz cevap veriyor.
     df = None
     MAX_DENEME = 4
     for deneme in range(1, MAX_DENEME + 1):
@@ -471,11 +348,11 @@ def get_bist_data(hisse_kodu):
                 break
             else:
                 print(f"⚠️ [{hisse_kodu}] deneme {deneme}/{MAX_DENEME}: veri eksik/boş geldi, tekrar denenecek")
-                df = aday_df  # en azından son alınanı sakla, hepsi başarısız olursa yine de kullanılabilir
+                df = aday_df
         except Exception as e:
             print(f"⚠️ [{hisse_kodu}] isyatirim deneme {deneme}/{MAX_DENEME} başarısız: {e}")
         if deneme < MAX_DENEME:
-            time.sleep(2)  # sunucuya nefes alma payı bırak
+            time.sleep(2)
     print(f"⏱️ [{hisse_kodu}] isyatirim fetch_financials ({deneme} deneme): {time.time() - _t2:.2f}s")
     if df is None or guncel_fiyat is None:
         return None
@@ -486,16 +363,6 @@ def get_bist_data(hisse_kodu):
             if "/" in str(col):
                 donem_sutunlari.append(col)
 
-    # --- DÜZELTME: KRONOLOJİK SIRALAMA ---
-    # Eskiden donem_sutunlari[-1] (API'nin döndürdüğü son sütun) "en güncel
-    # dönem" varsayılıyordu. Ama isyatirim'in yanıtı ara sıra eksik/kesik
-    # geldiğinde (bkz. Railway loglarındaki "Read timed out" uyarıları),
-    # sütunların sırası değişebiliyor veya en güncel çeyrek (örn. 2026/3)
-    # hiç gelmeyip veri 2025/12'de kalabiliyor — bu da aynı hisse için art
-    # arda yapılan çağrılarda FARKLI dönemlerin seçilmesine (ve dolayısıyla
-    # farklı HBK/Graham/adil değer sonuçlarına) yol açıyordu.
-    # Artık sütunlar "yıl/ay" değerine göre GERÇEKTEN sayısal olarak
-    # sıralanıyor, API'nin döndürme sırasına güvenilmiyor.
     def _donem_anahtari(kolon):
         try:
             y, a = str(kolon).split("/")
@@ -514,7 +381,6 @@ def get_bist_data(hisse_kodu):
     donen_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1A'].empty else 0
     duran_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AK'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AK'].empty else 0
     kisa_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2A'].empty else 0
-    # --- /debug ile bulunan gerçek kodlar ---
     stoklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AF'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AF'].empty else 0
     ticari_alacaklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AC'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AC'].empty else 0
     toplam_varliklar_gercek_temp = df[df['FINANCIAL_ITEM_CODE'] == '1BL'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1BL'].empty else 0
@@ -546,9 +412,6 @@ def get_bist_data(hisse_kodu):
     toplam_varliklar_gercek = temizle(toplam_varliklar_gercek_temp)
     uzun_vadeli_borc = temizle(uzun_vadeli_borc_temp)
 
-    # --- GERÇEK TTM (SON 4 ÇEYREK) HESAPLAMASI ---
-    # Formül: TTM = Bu yılki kümülatif + Geçen yılın tamamı(12 ay) - Geçen yılın aynı dönemi
-    # Bu, son 4 gerçek çeyreği otomatik olarak toplar, mevsimselliği dikkate alır.
     try:
         yil_str, ay_str = str(latest_col).split("/")
         yil = int(yil_str)
@@ -577,9 +440,8 @@ def get_bist_data(hisse_kodu):
             print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): latest_col ({latest_col}) için değer bulunamadı")
             return 0.0, False
         if ay_sayisi == 12 or yil is None:
-            return guncel, True  # zaten yıllık veri
+            return guncel, True
 
-        # 1. Deneme: isme göre ara ("2025/12", "2025/3" gibi)
         onceki_tam_yil_kolon = f"{yil - 1}/12"
         ayni_donem_gecen_yil_kolon = f"{yil - 1}/{ay_sayisi}"
         onceki_tam = item_deger(kod, onceki_tam_yil_kolon)
@@ -587,14 +449,8 @@ def get_bist_data(hisse_kodu):
         print(f"🔎 [{hisse_kodu}] ttm_hesapla({kod}) 1.deneme: guncel={guncel}, onceki_tam({onceki_tam_yil_kolon})={onceki_tam}, ayni_donem({ayni_donem_gecen_yil_kolon})={ayni_donem}")
         if onceki_tam is not None and ayni_donem is not None:
             print(f"🟢 [{hisse_kodu}] ttm_hesapla({kod}): GERÇEK TTM hesaplandı (isim eşleşmesi) = {guncel + onceki_tam - ayni_donem}")
-            return guncel + onceki_tam - ayni_donem, True  # gerçek TTM
+            return guncel + onceki_tam - ayni_donem, True
 
-        # 2. Deneme: isim eşleşmesi başarısız olursa, POZİSYONA
-        # göre ara. donem_sutunlari kronolojik sırayla tüm dönem
-        # sütunlarını içeriyor (örn. [...,"2025/3","2025/6","2025/9",
-        # "2025/12","2026/3"]). Şirket her yıl 4 çeyrek raporluyorsa:
-        # - "bir önceki tam yıl" = latest_col'dan 1 önceki sütun
-        # - "geçen yılın aynı dönemi" = latest_col'dan 4 önceki sütun
         try:
             latest_index = donem_sutunlari.index(latest_col)
             onceki_tam_idx = latest_index - 1
@@ -602,7 +458,6 @@ def get_bist_data(hisse_kodu):
             if onceki_tam_idx >= 0 and ayni_donem_idx >= 0:
                 onceki_tam_kolon_poz = donem_sutunlari[onceki_tam_idx]
                 ayni_donem_kolon_poz = donem_sutunlari[ayni_donem_idx]
-                # Doğrulama: "bir önceki tam yıl" gerçekten ".../12" ile bitiyor mu?
                 if str(onceki_tam_kolon_poz).endswith("/12"):
                     onceki_tam_poz = item_deger(kod, onceki_tam_kolon_poz)
                     ayni_donem_poz = item_deger(kod, ayni_donem_kolon_poz)
@@ -612,29 +467,18 @@ def get_bist_data(hisse_kodu):
         except (ValueError, IndexError) as e:
             print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): pozisyon denemesi hata: {e}")
 
-        # 3. Son çare: geçmiş yıl verisi hiçbir şekilde bulunamadı
-        # (örn. yeni halka arz), kaba yıllıklandırmaya düş
         print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): HER İKİ DENEME DE BAŞARISIZ, kaba ×{12/ay_sayisi if ay_sayisi else 1:.2f} kullanılıyor")
         carpan = 12 / ay_sayisi if ay_sayisi else 1
         return guncel * carpan, False
 
     net_kar, net_kar_ttm_gercek = ttm_hesapla('3L')
     favok, favok_ttm_gercek = ttm_hesapla('6A')
-    # --- Hasılat ve Satışların Maliyeti de TTM olarak hesaplanıyor ---
     hasilat, hasilat_ttm_gercek = ttm_hesapla('3C')
     satislarin_maliyeti_ham, cogs_ttm_gercek = ttm_hesapla('3CA')
-    satislarin_maliyeti = abs(satislarin_maliyeti_ham)  # "(-)" işaretli kalem, mutlak değer alınıyor
-    # --- DÜZELTME: Rapor notu artık SADECE net kârın gerçek TTM olup
-    # olmadığına bakıyor. Eskiden FAVÖK de başarısız olursa (örn. THYAO
-    # gibi FAVÖK kalemi olmayan/farklı yapıdaki şirketlerde) not yanlışlıkla
-    # "kaba tahmin" diyordu — net kâr gerçekten doğru hesaplanmış olsa bile.
-    # HBK/Graham/Peter Lynch zaten sadece net kâra dayandığı için, notun da
-    # net kârın durumunu yansıtması daha doğru.
+    satislarin_maliyeti = abs(satislarin_maliyeti_ham)
     ttm_gercek = net_kar_ttm_gercek
     yillik_carpan = 12 / ay_sayisi if ay_sayisi and ay_sayisi < 12 else 1
 
-    # --- Future F/K formülü için gerçek 6 aylık (H1) net kâr ---
-    # Doğru formül: Future F/K = PD / (6 aylık net kâr × 2)
     net_kar_6ay = None
     if yil is not None:
         h1_kolon = f"{yil}/6"
@@ -642,7 +486,6 @@ def get_bist_data(hisse_kodu):
         if h1_deger is not None and h1_deger > 0:
             net_kar_6ay = h1_deger
         elif ay_sayisi == 6:
-            # Zaten 6 aylık dönemdeysek mevcut kümülatif değer budur
             net_kar_6ay = item_deger('3L', latest_col)
 
     sonuc = {
@@ -666,34 +509,19 @@ def get_bist_data(hisse_kodu):
         'temettu_hisse_basi': temettu_hisse_basi,
         'ay_sayisi': ay_sayisi,
         'yillik_carpan': yillik_carpan,
-        'ttm_gercek': ttm_gercek,  # gerçek TTM mi, kaba tahmin mi
+        'ttm_gercek': ttm_gercek,
         'net_kar_6ay': net_kar_6ay,
         'piyasa': 'BIST',
         'para_birimi': 'TL',
     }
 
-    # --- DÜZELTME: ÖNBELLEĞE YAZMA EKLENDİ ---
-    # Eskiden _GUNLUK_ONBELLEK sadece OKUNUYOR, hiçbir yerde YAZILMIYORDU
-    # (bkz. yukarıdaki 223. satır) — bu yüzden önbellek fiilen hiç devreye
-    # girmiyor, her çağrı isyatirim'e yeniden gidiyor ve o anki sunucu
-    # yanıt kalitesine göre (gerçek TTM / eksik veri / kaba yıllıklandırma)
-    # FARKLI sonuçlar üretebiliyordu. Sadece GERÇEK TTM ile başarılı olan
-    # sonuçlar önbelleğe yazılıyor; kaba tahminle bitenler yazılmıyor ki
-    # bir sonraki sorguda isyatirim toparlanırsa gerçek veriyi yakalama
-    # şansı kalsın.
     if ttm_gercek:
         _onbellek_yaz(onbellek_anahtar, sonuc)
 
     return sonuc
 
 
-# --- 1b. ABD BORSASI VERİ ÇEKME (sadece yfinance ile) ---
 def get_us_data(hisse_kodu):
-    """
-    ABD hisseleri için yfinance zaten TTM (son 12 ay) EPS ve defter değerini
-    hazır verdiğinden BIST'teki gibi kümülatif dönem/yıllıklandırma
-    sorununa gerek yok.
-    """
     ticker = yf.Ticker(hisse_kodu)
     info = ticker.info
 
@@ -704,8 +532,8 @@ def get_us_data(hisse_kodu):
             return None
         guncel_fiyat = hist['Close'].iloc[-1]
 
-    eps = info.get('trailingEps')          # zaten TTM
-    bvps = info.get('bookValue')           # zaten hisse başına
+    eps = info.get('trailingEps')
+    bvps = info.get('bookValue')
     toplam_hisse = info.get('sharesOutstanding')
     favok = info.get('ebitda')
     temettu_hisse_basi = info.get('dividendRate')
@@ -713,12 +541,11 @@ def get_us_data(hisse_kodu):
     if not toplam_hisse or toplam_hisse <= 0:
         return {"hata": f"{hisse_kodu} için hisse adedi bulunamadı."}
     if eps is None and bvps is None:
-        return None  # muhtemelen geçerli bir ABD hissesi değil
+        return None
 
     net_kar = (eps * toplam_hisse) if eps else 0
     ozsermaye = (bvps * toplam_hisse) if bvps else 0
 
-    # Cari oran / kaldıraç için bilanço verisini dene (opsiyonel, yoksa 0 kalır)
     kisa_borc = 0.0
     toplam_varliklar = 0.0
     try:
@@ -754,12 +581,7 @@ def get_us_data(hisse_kodu):
     }
 
 
-# --- 1c. EVRENSEL VERİ ÇEKME: önce BIST, olmazsa ABD dener ---
 def get_company_data(hisse_kodu):
-    # --- DEĞİŞİKLİK: ABD borsası desteği devre dışı bırakıldı ---
-    # Sebep: Her /hesapla komutunda önce BIST denenip başarısız olunca
-    # ABD'yi denemek, BIST hisselerinde bile gereksiz gecikmeye (yavaşlığa)
-    # yol açıyordu. Odağı BIST'e geri veriyoruz.
     try:
         veri = get_bist_data(hisse_kodu)
         if veri is not None and "hata" not in veri:
@@ -801,7 +623,6 @@ def gordon_deger(temettu_hisse_basi, buyume=GORDON_BUYUME_ORANI, iskonto=GORDON_
     return d1 / (iskonto - buyume)
 
 
-# --- 2. HESAPLAMA FONKSİYONU ---
 def hesapla_ve_rapor_ver(hisse_kodu):
     veri = get_company_data(hisse_kodu)
     if veri is None or "hata" in veri:
@@ -833,33 +654,24 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     para_birimi = veri.get('para_birimi', 'TL')
     sembol = "TL" if para_birimi == "TL" else "$"
 
-    is_banka = hisse_kodu in BANKALAR  # sadece BIST bankaları için anlamlı
+    is_banka = hisse_kodu in BANKALAR
 
     fk = f / hbk if hbk > 0 else 0
     pddd = f / hbdd if hbdd > 0 else 0
     roe = net_kar / ozsermaye if ozsermaye > 0 else 0
     cari_oran = aktif / kisa_borc if kisa_borc > 0 else 0
 
-    # --- Kaldıraç Oranı kaynağa göre doğru hesaplanıyor:
-    # (Kısa + Uzun Vadeli Toplam Borç) / Toplam Varlıklar
     toplam_borc = kisa_borc + uzun_vadeli_borc
     kaldiraç = toplam_borc / aktif if aktif > 0 else 0
 
-    # --- Asit-Test Oranı (Dönen Varlıklar - Stoklar) / Kısa Vadeli Borç ---
     asit_test = (donen_varliklar - stoklar) / kisa_borc if kisa_borc > 0 else 0
 
-    # --- Duran Varlıkların Özsermayeye Oranı ---
     duran_ozkaynak_orani = duran_varliklar / ozsermaye if ozsermaye > 0 else 0
 
-    # --- Alacak Devir Hızı = Hasılat / Ticari Alacaklar ---
     alacak_devir_hizi = hasilat / ticari_alacaklar if ticari_alacaklar > 0 else 0
 
-    # --- Stok Devir Hızı = Satışların Maliyeti / Stoklar ---
-    # NOT: Doğrusu "ortalama stok" kullanmaktır (dönem başı+sonu / 2),
-    # şu an sadece dönem sonu stok kullanılıyor (yaklaşık değer).
     stok_devir_hizi = satislarin_maliyeti / stoklar if stoklar > 0 else 0
 
-    # --- Net Kâr Marjı = Net Kâr / Hasılat ---
     net_kar_marji = net_kar / hasilat if hasilat > 0 else 0
 
     hedef_pddd = (f / pddd) * 1.3 if pddd > 0 else 0
@@ -867,9 +679,14 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     peter = hbk * 15 if hbk > 0 else 0
     peg = fk / 15 if fk > 0 else 0
 
+    # DÜZELTME: Firma Değeri (FD) = Piyasa Değeri + TOPLAM Borç
+    # (kısa + uzun vadeli). Eskiden sadece kısa vadeli borç (kisa_borc)
+    # kullanılıyordu, uzun vadeli borç tamamen dışarıda bırakılıyordu —
+    # bu da özellikle uzun vadeli borcu yüksek şirketlerde FD/FAVÖK
+    # bazlı hedefi ve Net Borç/FAVÖK oranını olduğundan düşük gösteriyordu.
     if not is_banka and favok > 0:
-        hedef_fd_favok = (f / ((f * toplam_hisse + kisa_borc) / favok)) * 10
-        net_borc_favok = kisa_borc / favok
+        hedef_fd_favok = (f / ((f * toplam_hisse + toplam_borc) / favok)) * 10
+        net_borc_favok = toplam_borc / favok
     else:
         hedef_fd_favok = 0
         net_borc_favok = 0
@@ -877,27 +694,15 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     dcf_deger = basit_dcf_deger(net_kar, toplam_hisse) if not is_banka else None
     gordon = gordon_deger(temettu_hisse_basi)
 
-    # --- DEĞİŞİKLİK: sektör/emsal karşılaştırması geçici olarak kapatıldı ---
-    # Sebep: Her hissede 4-8 emsal hisseyi ayrı ayrı çekmek (isyatirim + yfinance),
-    # tek bir /hesapla komutunu 5+ hissenin verisini çekmeye dönüştürüyordu,
-    # bu da ciddi yavaşlığa ve rate-limit riskine yol açıyordu. İleride
-    # basit bir zaman-bazlı cache (örn. 1 saatlik) ile geri getirilebilir.
     sektor_bilgi = None
     sektor_hedef_fk = None
     if sektor_bilgi and sektor_bilgi.get('ort_fk') and hbk > 0:
         sektor_hedef_fk = hbk * sektor_bilgi['ort_fk']
 
-    # --- Tarihsel/Future F/K artık keyfi sabitler yerine gerçek sektör
-    # (veya BIST100 hazır olduğunda) F/K'sını çarpan olarak kullanıyor.
-    # Sektör verisi yoksa bu deneysel değerler hesaplanamaz, "N/A" gösterilir.
     carpan_fk = sektor_bilgi['ort_fk'] if sektor_bilgi and sektor_bilgi.get('ort_fk') else None
 
-    # Tarihsel F/K: gerçek 3 yıllık ortalama F/K verisi şu an çekilmiyor
-    # (geçmiş her dönem için ayrı fiyat verisi gerektirir), bu yüzden bu
-    # değer güvenilir değildir ve raporda ayrıca işaretlenir.
-    hedef_tarihsel_fk = None  # yeterli veri yok, gösterilmeyecek
+    hedef_tarihsel_fk = None
 
-    # Future F/K: PD / (6 aylık net kâr × 2) — dokümandaki formül birebir
     if net_kar_6ay and net_kar_6ay > 0 and carpan_fk:
         piyasa_degeri = f * toplam_hisse
         future_fk = piyasa_degeri / (net_kar_6ay * 2)
@@ -905,10 +710,14 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     else:
         hedef_future_fk = None
 
-    hedef_odennis_sermaye = (net_kar / toplam_hisse) * 10 if toplam_hisse > 0 else 0
+    # DÜZELTME: net kâr negatifken (zarar eden şirket) bu formüller
+    # negatif/anlamsız bir "hedef fiyat" üretiyordu (örn. TTRAK'ta
+    # -509,90 TL gibi). Bir hissenin hedef fiyatı negatif olamayacağı
+    # için, net kâr negatif olduğunda bu hedefler None (N/A) yapılıyor.
+    hedef_odennis_sermaye = (net_kar / toplam_hisse) * 10 if (toplam_hisse > 0 and net_kar > 0) else None
 
     ppd = (net_kar * 7) + (0.5 * ozsermaye)
-    hedef_ppd = ppd / toplam_hisse if toplam_hisse > 0 else 0
+    hedef_ppd = ppd / toplam_hisse if (toplam_hisse > 0 and net_kar > 0) else None
 
     degerler = [hedef_pddd, graham, peter, hedef_fd_favok]
     gecerli = [d for d in degerler if d > 0]
@@ -967,7 +776,19 @@ def hesapla_ve_rapor_ver(hisse_kodu):
 
     if ic_sel_deger > 0:
         rapor += f"⭐ **GENEL ORTALAMA ADİL DEĞER:**\n**{tl(ic_sel_deger)} {sembol}**\n"
-        rapor += f"_(Graham, Peter Lynch, PD/DD ve FD/FAVÖK ortalaması)_\n\n"
+        rapor += f"_(Graham, Peter Lynch, PD/DD ve FD/FAVÖK ortalaması)_\n"
+        # DÜZELTME: kaç yöntemin gerçekten hesaba katıldığı belirtiliyor.
+        # Zarar eden şirketlerde Graham ve Peter Lynch sıfırlandığı için
+        # ortalama bazen TEK bir yönteme (örn. sadece PD/DD) dayanıyordu,
+        # ama rapor bunu "4 yöntemin ortalaması" gibi gösteriyordu.
+        if len(gecerli) < len(degerler):
+            rapor += (
+                f"⚠️ _Not: {len(degerler)} yöntemden sadece {len(gecerli)} tanesi "
+                f"hesaplanabildi (muhtemelen zarar/negatif kâr nedeniyle diğerleri "
+                f"N/A) — ortalama bu {len(gecerli)} yönteme dayanıyor, güvenilirliği "
+                f"buna göre değerlendirin._\n"
+            )
+        rapor += "\n"
         fark = ((f - ic_sel_deger) / ic_sel_deger) * 100
         if fark < -5:
             rapor += f"📈 Hisse adil değerine göre %{round(abs(fark), 1)} İSKONTOLU (UCUZ) görünüyor.\n"
@@ -1042,8 +863,14 @@ def hesapla_ve_rapor_ver(hisse_kodu):
         )
     else:
         rapor += f"🔻 Future's F/K Bazlı Hedef: N/A _(6 aylık veri veya sektör F/K'sı yok)_\n"
-    rapor += f"🔻 Ödenmiş Sermaye Bazlı Hedef: {tl(hedef_odennis_sermaye)} {sembol} (HBK x 10)\n"
-    rapor += f"🔻 PPD Bazlı Hedef: {tl(hedef_ppd)} {sembol} (Geleneksel ağırlık)\n"
+    if hedef_odennis_sermaye is not None:
+        rapor += f"🔻 Ödenmiş Sermaye Bazlı Hedef: {tl(hedef_odennis_sermaye)} {sembol} (HBK x 10)\n"
+    else:
+        rapor += f"🔻 Ödenmiş Sermaye Bazlı Hedef: N/A _(şirket zarar ettiği için hesaplanamıyor)_\n"
+    if hedef_ppd is not None:
+        rapor += f"🔻 PPD Bazlı Hedef: {tl(hedef_ppd)} {sembol} (Geleneksel ağırlık)\n"
+    else:
+        rapor += f"🔻 PPD Bazlı Hedef: N/A _(şirket zarar ettiği için hesaplanamıyor)_\n"
     rapor += f"---\n\n"
 
     rapor += f"**🩺 FİNANSAL SAĞLIK:**\n"
@@ -1071,15 +898,10 @@ def hesapla_ve_rapor_ver(hisse_kodu):
             f"özel bir format ayrımı henüz yapılmadı, dikkatli yorumlayın.*\n"
         )
 
-    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n\"Kader ironiye aşıktır. İki 3, üç 2 harften oluşur.\"\n@Levent8263"
+    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\nAcele edip aldığım hiçbir üründen kar edemedim.\n\nNicolas Darvas\n@Levent8263"
     return rapor
 
-# --- 3. TELEGRAM KOMUTU ---
-# --- /debug KOMUTU ---
-# Bir hissenin isyatirim'den gelen TÜM ham kalem kodlarını ve isimlerini
-# gösterir. Amaç: Hasılat, Stoklar, Ticari Alacaklar gibi henüz kod
-# numarasını bilmediğimiz kalemleri GERÇEK veriden bulmak — tahmin
-# etmek yerine. Çıktıyı görüp doğru kodları koda ekleyeceğiz.
+
 @bot.message_handler(commands=['debug'])
 def handle_debug(message):
     try:
@@ -1100,18 +922,15 @@ def handle_debug(message):
             bot.reply_to(message, "❌ Veri bulunamadı.")
             return
 
-        # Sütun isimlerini göster (hangi dönemler geldi?)
         kolon_metni = "📋 **Gelen dönem sütunları:**\n" + ", ".join([str(c) for c in df.columns]) + "\n\n"
         bot.reply_to(message, kolon_metni)
 
-        # Her kalem kodu + Türkçe ismini listele (tekrar etmeden)
         if 'FINANCIAL_ITEM_CODE' in df.columns and 'FINANCIAL_ITEM_NAME_TR' in df.columns:
             satirlar = []
             for _, row in df.iterrows():
                 kod = row.get('FINANCIAL_ITEM_CODE', '?')
                 isim = row.get('FINANCIAL_ITEM_NAME_TR', '?')
                 satirlar.append(f"{kod} → {isim}")
-            # Telegram mesaj uzunluğu sınırlı, parçalara bölerek gönder
             metin = "\n".join(satirlar)
             for i in range(0, len(metin), 3500):
                 bot.reply_to(message, metin[i:i+3500])
@@ -1138,14 +957,6 @@ def handle_hesapla(message):
 
 print("🤖 Borsa Botu başarıyla başlatıldı. Telegram mesajları bekleniyor...")
 
-# --- YENİ: KENDİNİ İYİLEŞTİREN BAŞLATMA DÖNGÜSÜ ---
-# Sorun: bot.infinity_polling(), 409 "Conflict" hatası (genelde redeploy
-# sırasında eski konteynerin tam kapanmadan yeni konteynerin başlamasından
-# kaynaklanan geçici bir çakışma) aldığında SESSİZCE devam etmiyor,
-# hatayı fırlatıp TÜM SÜRECİ ÇÖKERTİYORDU. Bu da Railway'in botu manuel
-# yeniden başlatmasını gerektiriyordu. Artık bunu dıştan bir döngüyle
-# sarmalıyoruz: çökerse birkaç saniye bekleyip KENDİSİ tekrar dener,
-# Railway'in ayrıca müdahale etmesine gerek kalmaz.
 while True:
     try:
         bot.remove_webhook()
