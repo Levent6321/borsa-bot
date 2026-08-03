@@ -1,1160 +1,1238 @@
+"""
+DENGE ARALIĞI TELEGRAM BOTU (3 Kaynaklı Hibrit Model)
+============================================================================
+1) Twelve Data      -> BTCUSD, XAUUSD, EURUSD gibi standart forex/kripto/emtia
+2) isyatirimhisse    -> XU100, XU030, XU500 gibi BIST endeksleri (İş Yatırım)
+3) Stooq (yedek)     -> Twelve Data'da ücretsiz planda kapalı olan XAGUSD,
+                        XPTUSD, XPDUSD, VIX, DXY gibi semboller için denenir
+                        (garantisi yoktur, Twelve Data reddederse devreye girer)
+XAUTRYG (Gram Altın/TL) ise XAUUSD ve USDTRY üzerinden TÜRETİLİR.
+
+GÜNCELLEME NOTU: Stooq ve yfinance sık sık "Too Many Requests" (rate limit)
+hatası verdiği için şu iyileştirmeler eklendi:
+  - Her iki kaynağa da gerçek tarayıcı User-Agent'ı ile istek atılıyor.
+  - yfinance isteklerinde basit retry/backoff var.
+  - Sonuçlar kısa süreli (5 dk) bellek-içi önbellekte tutuluyor, böylece
+    aynı sembol için art arda gelen istekler (4 saatlik/günlük/haftalık/
+    aylık) gereksiz yere kaynağı tekrar tekrar yormuyor.
+  - "Too many requests / rate limit" durumu ayrı ve daha anlaşılır bir
+    hata mesajıyla kullanıcıya bildiriliyor.
+
+GÜNCELLEME NOTU 2: Telegram mesajları artık Markdown yerine HTML parse_mode
+ile gönderiliyor. Eski Markdown (V1) ayrıştırıcısı, dinamik içerikte (hata
+mesajları, sembol adları vb.) birden fazla *, _, ` gibi özel karakter iç
+içe geçtiğinde çok kolay bozuluyor ve "Can't parse entities" BadRequest
+hatasıyla mesajın TAMAMEN gönderilmesini engelliyordu. HTML modu hem daha
+az kırılgan hem de dinamik metinler html.escape() ile güvenle kaçırılabiliyor.
+"""
+
 import os
-import telebot
-import yfinance as yf
-import isyatirimhisse
-from datetime import datetime, date, timedelta
-import math
 import time
-import socket
-import json
-import redis
+import html
+import logging
+import statistics
+from collections import Counter
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
-# --- YENİ: SOCKET ZAMAN AŞIMI ARTIRILDI ---
-# Sebep: Railway loglarında isyatirim.com.tr'nin "Read timed out (read
-# timeout=10)" hatası verdiği görüldü — kütüphanenin kendi içinde sabit
-# 10 saniyelik bir zaman aşımı var. isyatirim'in sunucusu bazen 10
-# saniyeden uzun sürebiliyor (bizim kontrolümüz dışında bir yavaşlık).
-# socket.setdefaulttimeout() global bir taban değer koyar; kütüphane
-# açıkça daha kısa bir timeout vermediği sürece bu devreye girer ve
-# isteklerin daha uzun süre beklemesine izin verir.
-socket.setdefaulttimeout(15)
+import requests
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- BOT AYARLARI ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("❌ HATA: BOT_TOKEN ortam değişkeni bulunamadı!")
-    exit(1)
+try:
+    import isyatirimhisse
+except ImportError:
+    isyatirimhisse = None
 
-bot = telebot.TeleBot(BOT_TOKEN)
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
 
-# --- BANKA/FİNANS KURULUŞU LİSTESİ (sadece BIST için) ---
-# NOT: TKFEN (Tekfen Holding) buradan çıkarıldı — o bir banka değil,
-# inşaat/tarım ağırlıklı bir holding. Yanlışlıkla bankalar listesindeydi
-# ve gereksiz yere Graham/DCF hesaplarından dışlanıyordu.
-# KTLEV (Katılımevim Tasarruf Finansman) eklendi — BDDK lisanslı bir
-# finansman şirketi, bankalarla aynı sebepten (farklı bilanço formatı,
-# FD/FAVÖK gibi oranlar anlamsız) burada tutuluyor.
-BANKALAR = ["AKBNK", "GARAN", "YKBNK", "ISCTR", "VAKBN", "HALKB", "SKBNK", "KTLEV"]
+# ----------------------------------------------------------------------------
+# AYARLAR
+# ----------------------------------------------------------------------------
 
-# --- DCF VARSAYIMLARI ---
-DCF_BUYUME_ORANI = 0.15
-DCF_ISKONTO_ORANI = 0.30
-DCF_TERMINAL_BUYUME = 0.10
-DCF_YIL_SAYISI = 5
+load_dotenv()
 
-# --- GORDON (TEMETTÜ İSKONTO MODELİ) VARSAYIMLARI ---
-GORDON_BUYUME_ORANI = 0.10
-GORDON_ISKONTO_ORANI = 0.30
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
+# metalpriceapi.com - XAGUSD/XPTUSD/XPDUSD için Stooq/Yahoo'dan ÖNCE denenen,
+# API key ile çalışan (scraping olmayan) stabil ücretsiz kaynak.
+# ÖNEMLİ: Bu key'i asla kod içine yazıp commit ETMEYİN (repo public!).
+# Railway/Heroku ortam değişkenlerine METALPRICEAPI_KEY adıyla ekleyin.
+METALPRICEAPI_KEY = os.getenv("METALPRICEAPI_KEY")
+
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+
+CREDIT_BAR_UNIT = 21
+MAX_SHORT_DAILY_BARS = 60
+MAX_LONG_WEEKLY_BARS = 84
+FOUR_HOUR_OUTPUTSIZE = 20
+
+# MetalpriceAPI ücretsiz planında tek istekte sorgulanabilecek en fazla gün
+# sayısı (bkz. _fetch_bars_metalpriceapi_uncached içindeki plan sınırları).
+# Modül seviyesine taşındı çünkü fetch_bars_metalpriceapi() de bu değere
+# bakarak, isteneni karşılayamayacağı belliyse erkenden hata fırlatıp bir
+# sonraki kaynağa (Stooq/yfinance) geçilmesini sağlıyor.
+METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS = 4  # 5 günlük sınırın altında güvenli tampon
+
+PERIOD_NAMES = ["4 Saatlik", "Günlük", "Haftalık", "Aylık", "6 Aylık", "Yıllık"]
+
+TR_TZ = ZoneInfo("Europe/Istanbul")
+
+# Stooq / Yahoo gibi siteler User-Agent'sız isteklerde daha kolay rate-limit
+# uyguluyor; gerçek bir tarayıcı gibi görünmek için ortak header seti.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+}
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
-def cari_oran_yorum(deger):
-    """Cari Oran: kısa vadeli borç ödeme gücü. İdeal aralık 1,5-2,5."""
-    if deger <= 0:
-        return "veri yok"
-    if 1.5 <= deger <= 2.5:
-        return "İyi"
-    elif deger >= 1:
-        return "Normal"
-    else:
-        return "Riskli"
+# ----------------------------------------------------------------------------
+# BASİT BELLEK-İÇİ ÖNBELLEK (rate limit'i azaltmak için)
+# ----------------------------------------------------------------------------
+# Aynı (kaynak, sembol, interval, outputsize) kombinasyonu kısa süre içinde
+# tekrar istenirse ağa gitmek yerine önbellekten döner. Bu, tek bir sembol
+# sorgusunda 4 saatlik/günlük/haftalık gibi birden fazla çağrının Stooq/
+# yfinance'i art arda yormasını engeller.
+
+_CACHE: dict[str, tuple[float, object]] = {}
+_CACHE_TTL_SECONDS = 900  # 15 dakika (Yahoo/Stooq rate-limit riskini azaltmak için)
 
 
-def kaldirac_yorum(yuzde):
-    """Kaldıraç Oranı (Toplam Borç/Toplam Varlık %): kaynağa göre ≤%50 istenir."""
-    if yuzde <= 0:
-        return "veri yok"
-    if yuzde <= 50:
-        return "İyi"
-    elif yuzde <= 65:
-        return "Normal"
-    else:
-        return "Riskli"
+def _cached_fetch(cache_key: str, fetch_fn):
+    now = time.time()
+    cached = _CACHE.get(cache_key)
+    if cached is not None:
+        ts, data = cached
+        if now - ts < _CACHE_TTL_SECONDS:
+            return data
+    data = fetch_fn()
+    _CACHE[cache_key] = (now, data)
+    return data
 
-# --- SEKTÖR/EMSAL GRUPLARI (gerçek BIST piyasa değeri verisiyle güncellendi) ---
-# Her grup, o sektördeki en büyük (en likit) piyasa değerine sahip hisselerden
-# seçildi — performans için grup başına ~5-8 hisseyle sınırlı tutuldu.
-# NOT: GYO (Gayrimenkul Yatırım Ortaklığı) şirketleri gelirlerini gayrimenkul
-# yeniden değerleme kazançlarından da elde ettiği için Graham/Peter Lynch gibi
-# kâr-bazlı formüllerde diğer sektörlere göre daha az güvenilir olabilir.
-#
-# NOT (DEVRE DIŞI BIRAKILDI): Bu grup tanımları hâlâ burada duruyor çünkü
-# sektor_ortalama_carpanlar() fonksiyonu kod tabanından silinmedi — sadece
-# çağrılmıyor (bkz. hesapla_ve_rapor_ver içindeki "sektor_bilgi = None").
-# İleride zaman-bazlı bir cache eklenirse tek satır değiştirilerek geri
-# açılabilir.
-SEKTOR_GRUPLARI = {
-    "Otomotiv": ["FROTO", "TOASO", "DOAS", "OTKAR", "BRISA"],
-    "Demir-Çelik": ["EREGL", "ISDMR", "BRSAN", "KRDMD", "KRDMA", "KRDMB"],
-    "Holding": ["KCHOL", "SAHOL", "DOHOL", "ALARK", "TKFEN"],
-    "Perakende": ["BIMAS", "MGROS", "SOKM"],
-    "Gıda-İçecek": ["ULKER", "CCOLA", "AEFES", "TATGD"],
-    "Havacılık-Ulaşım": ["THYAO", "PGSUS", "TAVHL", "RYSAS", "CLEBI"],
-    "Telekomünikasyon": ["TCELL", "TTKOM", "KRONT"],
-    "Enerji-Petrol": ["TUPRS", "AKSEN", "ENJSA", "AHGAZ", "ENERY", "AYGAZ", "ZOREN"],
-    "İnşaat Malzemeleri": ["OYAKC", "BSOKE", "CIMSA", "AKCNS", "NUHCM", "BTCIM"],
-    "GYO": ["EKGYO", "TRGYO", "ZRGYO", "RALYH", "PEKGY", "RGYAS", "RYGYO", "AKFIS"],
-    "Kimya-Petrokimya": ["SASA", "PETKM", "TRALT", "GUBRF", "AKSA", "HEKTS"],
-    "Savunma-Teknoloji": ["ASELS", "LOGO", "NETAS"],
-    "Sigorta": ["TURSG", "ANSGR", "AGESA"],
-    "Beyaz Eşya-Elektronik": ["ARCLK", "VESTL"],
-    "Madencilik": ["KOZAL", "KOZAA"],
-    "Cam-Kimya": ["SISE"],
-    "Sağlık": ["SELEC", "MPARK", "ECILC", "GENIL", "DEVA", "KAYSE"],
+
+def _is_rate_limit_text(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in [
+        "too many requests", "rate limit", "rate-limited", "429",
+    ])
+
+
+# ----------------------------------------------------------------------------
+# SEMBOL NORMALİZASYON
+# ----------------------------------------------------------------------------
+
+def normalize_symbol(user_symbol: str) -> str:
+    """'BTCUSD' -> 'BTC/USD', 'XAUUSD' -> 'XAU/USD' gibi Twelve Data formatına çevirir."""
+    s = user_symbol.strip().upper().replace(" ", "")
+    if "/" in s:
+        return s
+    if len(s) > 3:
+        base, quote = s[:-3], s[-3:]
+        return f"{base}/{quote}"
+    return s
+
+
+def _normalize_stooq_symbol(user_symbol: str) -> str:
+    """Kullanıcı girdisini Stooq formatına çevirir (yedek kaynak için)."""
+    s = user_symbol.strip().upper().replace(" ", "")
+
+    # VIX özel durumu (endeksler Stooq'ta '^' öneki alır)
+    if s in ("VIX", "VIXUSD"):
+        return "^vix"
+
+    # DXY: Stooq'ta net teyit edilemedi, en olası tahmin denenir
+    if s in ("DXY", "DXYUSD"):
+        return "usdx"
+
+    # Forex/emtia genel formatı: küçük harf, ayraçsız (xauusd, xagusd, xptusd, xpdusd vb.)
+    return s.replace("/", "").lower()
+
+
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - ANA KAYNAK: Twelve Data
+# ----------------------------------------------------------------------------
+
+def fetch_bars_twelvedata(user_symbol: str, interval: str, outputsize: int):
+    """Twelve Data'dan belirtilen aralıkta son `outputsize` mumu çeker."""
+    if not TWELVE_DATA_API_KEY:
+        raise ValueError("TWELVE_DATA_API_KEY tanımlı değil. Ortam değişkenlerini kontrol edin.")
+
+    symbol = normalize_symbol(user_symbol)
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVE_DATA_API_KEY,
+    }
+
+    resp = requests.get(TWELVE_DATA_URL, params=params, timeout=15)
+    data = resp.json()
+
+    if isinstance(data, dict) and data.get("status") == "error":
+        msg = data.get("message", "")
+        # "plan" / "Grow" / "Venture" / "available starting" geçiyorsa
+        # -> bu sembol ücretsiz planda kapalı, yedek kaynağa geçilecek
+        if any(word in msg.lower() for word in [
+            "plan", "grow", "venture", "available starting",
+            "not found", "no data", "invalid symbol", "does not exist",
+        ]):
+            raise ValueError("UPGRADE_REQUIRED")
+        raise ValueError(msg)
+
+    if "values" not in data:
+        raise ValueError(f"'{symbol}' için veri bulunamadı. Sembolü kontrol edin (örn: BTCUSD, XAUUSD, EURUSD).")
+
+    return data["values"]
+
+
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - BIST ENDEKSLERİ: isyatirimhisse (İş Yatırım)
+# ----------------------------------------------------------------------------
+
+# XU100/XU030/XU500 gibi BIST endeksleri Twelve Data'da hiç bulunmuyor.
+# Bunlar için doğrudan İş Yatırım'ın verisi (isyatirimhisse) kullanılır.
+BIST_INDEX_ALIASES = {
+    "XU100": "XU100", "BIST100": "XU100",
+    "XU030": "XU030", "XU30": "XU030", "BIST30": "XU030",
+    "XU500": "XU500", "BIST500": "XU500",
 }
 
 
-def hissenin_sektoru(hisse_kodu):
-    for sektor, hisseler in SEKTOR_GRUPLARI.items():
-        if hisse_kodu in hisseler:
-            return sektor, hisseler
-    return None, []
+def _normalize_date_str(raw) -> str:
+    """isyatirimhisse'den gelen tarihi 'YYYY-MM-DD' formatına çevirir
+    (kaynak GG-AA-YYYY, GG.AA.YYYY ya da zaten ISO olabilir)."""
+    raw = str(raw).strip()
+    if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
+        return raw[:10]
+    for sep in ("-", ".", "/"):
+        parts = raw.split(sep)
+        if len(parts) == 3:
+            if len(parts[2]) == 4:  # GG-AA-YYYY
+                gg, aa, yyyy = parts
+                return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
+            if len(parts[0]) == 4:  # YYYY-AA-GG
+                yyyy, aa, gg = parts
+                return f"{yyyy}-{aa.zfill(2)}-{gg.zfill(2)}"
+    raise ValueError(f"Tarih formatı tanınamadı: {raw}")
 
 
-def sektor_ortalama_carpanlar(hisse_kodu):
-    """
-    Aynı sektördeki diğer hisselerin F/K ve PD/DD medyanını hesaplar.
-    NOT: Sadece 2-5 hisselik küçük gruplar olduğu için istatistiksel
-    olarak "kesin" bir sektör ortalaması değil, kaba bir emsal kıyaslaması.
-    Ortalamaya (Genel Ortalama Adil Değer'e) dahil edilmez, sadece bağlam
-    sağlamak için deneysel bölümde gösterilir.
+def fetch_bars_bist_index(user_symbol: str, interval: str, outputsize: int):
+    """BIST endeksleri (XU100/XU030/XU500) için İş Yatırım'dan veri çeker.
+    Bu kaynakta gün-içi (4 saatlik) veri YOKTUR."""
+    if interval == "4h":
+        raise ValueError("İş Yatırım kaynağında 4 saatlik veri yok.")
 
-    NOT: Bu fonksiyon şu an çağrılmıyor (bkz. hesapla_ve_rapor_ver içindeki
-    "sektor_bilgi = None" satırı). Sebep: her çağrıda 4-8 emsal hisseyi
-    ayrı ayrı çekmek (isyatirim + yfinance), tek bir /hesapla komutunu
-    5+ hissenin verisini çekmeye dönüştürüp ciddi yavaşlığa ve rate-limit
-    riskine yol açıyordu. Fonksiyon ileride bir cache mekanizmasıyla
-    birlikte tekrar devreye alınabilir diye silinmedi.
+    if isyatirimhisse is None:
+        raise ValueError("isyatirimhisse kütüphanesi kurulu değil.")
 
-    DÜZELTME: Aritmetik ortalama yerine MEDYAN kullanılıyor ve aşırı uçuk
-    F/K (>60) ile PD/DD (>10) değerleri filtreleniyor. Sebep: küçük emsal
-    gruplarında (özellikle sektörün geneli düşük kârlılık yaşadığında) tek
-    bir aşırı yüksek F/K'lı hisse, ortalamayı anlamsız şekilde şişirebiliyor
-    (örn. EREGL testinde "Sektör Ort. F/K: 171" gibi gerçekçi olmayan bir
-    sonuç çıkmıştı — medyan ve filtre bunu büyük ölçüde engeller).
-    """
-    sektor, emsaller = hissenin_sektoru(hisse_kodu)
-    if sektor is None:
-        return None
+    index_code = BIST_INDEX_ALIASES[user_symbol.strip().upper().replace(" ", "")]
 
-    FK_UST_SINIR = 60
-    PDDD_UST_SINIR = 10
+    today = datetime.now(TR_TZ).date()
+    start = today - timedelta(days=800)  # ~2.2 yıl geriye, yıllık ihtiyacı karşılar
 
-    fk_listesi = []
-    pddd_listesi = []
-    for emsal in emsaller:
-        if emsal == hisse_kodu:
-            continue
+    df = isyatirimhisse.fetch_index_data(
+        indices=index_code,
+        start_date=start.strftime("%d-%m-%Y"),
+        end_date=today.strftime("%d-%m-%Y"),
+    )
+
+    if df is None or df.empty:
+        raise ValueError(f"İş Yatırım'dan '{user_symbol}' için veri alınamadı.")
+
+    date_col = next((c for c in df.columns if "tarih" in c.lower() or "date" in c.lower()), None)
+    high_col = next((c for c in df.columns if "yuksek" in c.lower() or "high" in c.lower()), None)
+    low_col = next((c for c in df.columns if "dusuk" in c.lower() or "low" in c.lower()), None)
+    close_col = next(
+        (c for c in df.columns if any(k in c.lower() for k in ("kapanis", "close", "deger", "value", index_code.lower()))),
+        None,
+    )
+
+    if date_col is None or (close_col is None and (high_col is None or low_col is None)):
+        raise ValueError(f"İş Yatırım verisi beklenmeyen formatta (sütunlar: {list(df.columns)}).")
+
+    bars = []
+    for _, row in df.iterrows():
         try:
-            veri = get_bist_data(emsal)
+            dt_str = _normalize_date_str(row[date_col])
+            close_val = float(row[close_col]) if close_col else None
+            high_val = float(row[high_col]) if high_col else close_val
+            low_val = float(row[low_col]) if low_col else close_val
+            if high_val is None or low_val is None:
+                continue
+            bars.append({
+                "datetime": dt_str,
+                "high": high_val,
+                "low": low_val,
+                "close": close_val if close_val is not None else (high_val + low_val) / 2,
+            })
         except Exception:
-            veri = None
-        if veri is None or "hata" in veri:
             continue
-        f_emsal = veri['fiyat']
-        hbk_emsal = veri['hbk']
-        hbdd_emsal = veri['hbdd']
-        if hbk_emsal and hbk_emsal > 0:
-            fk_emsal = f_emsal / hbk_emsal
-            if 0 < fk_emsal <= FK_UST_SINIR:
-                fk_listesi.append(fk_emsal)
-        if hbdd_emsal and hbdd_emsal > 0:
-            pddd_emsal = f_emsal / hbdd_emsal
-            if 0 < pddd_emsal <= PDDD_UST_SINIR:
-                pddd_listesi.append(pddd_emsal)
 
-    if not fk_listesi and not pddd_listesi:
-        return None
+    if not bars:
+        raise ValueError(f"'{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
 
-    def medyan(liste):
-        s = sorted(liste)
-        n = len(s)
-        orta = n // 2
-        if n % 2 == 0:
-            return (s[orta - 1] + s[orta]) / 2
-        return s[orta]
+    bars.sort(key=lambda b: b["datetime"])
+    return bars[-outputsize:] if len(bars) > outputsize else bars
 
-    return {
-        'sektor': sektor,
-        'emsal_sayisi': len(emsaller) - 1,
-        'ort_fk': medyan(fk_listesi) if fk_listesi else None,
-        'ort_pddd': medyan(pddd_listesi) if pddd_listesi else None,
-        'kullanilan_emsal_sayisi': len(fk_listesi),  # filtre sonrası kaç hisse gerçekten kullanıldı
+
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - YEDEK KAYNAK: MetalpriceAPI (sadece XAG/XPT/XPD için, Twelve
+# Data kapalıysa Stooq/Yahoo'dan ÖNCE denenir)
+# ----------------------------------------------------------------------------
+# metalpriceapi.com, API key ile çalışan gerçek bir servistir (scraping
+# değildir), bu yüzden Stooq/Yahoo'nun yaşadığı "bot sanılıp engellenme"
+# riski yoktur. Ücretsiz planda ayda 100 istek hakkı var; bu yüzden burada
+# tek bir "timeframe" isteğiyle (365 güne kadar) hem günlük hem haftalık
+# ihtiyacı karşılıyoruz (haftalık barlar günlük veriden yerel olarak
+# toplanıyor), kotayı en verimli şekilde kullanmak için.
+
+METALPRICEAPI_URL = "https://api.metalpriceapi.com/v1/timeframe"
+
+# Bu bot sadece Twelve Data'da kapalı olan metaller için MetalpriceAPI'yi
+# dener; DXY/VIX gibi metal olmayan semboller için bu kaynak atlanır.
+METALPRICEAPI_SYMBOL_MAP = {
+    "XAGUSD": "XAG",  # Gümüş
+    "XPTUSD": "XPT",  # Platin
+    "XPDUSD": "XPD",  # Paladyum
+}
+
+
+def _fetch_bars_metalpriceapi_uncached(user_symbol: str, interval: str, outputsize: int):
+    if interval == "4h":
+        raise ValueError("MetalpriceAPI kaynağında 4 saatlik veri yok.")
+    if not METALPRICEAPI_KEY:
+        raise ValueError("METALPRICEAPI_KEY tanımlı değil.")
+
+    normalized_input = user_symbol.strip().upper().replace(" ", "")
+    metal_code = METALPRICEAPI_SYMBOL_MAP.get(normalized_input)
+    if metal_code is None:
+        raise ValueError(f"MetalpriceAPI '{user_symbol}' sembolünü desteklemiyor.")
+
+    # ÖNEMLİ - DOĞRULANMIŞ ÜCRETSİZ PLAN SINIRLARI (canlı API hatalarıyla teyit edildi):
+    #   1) "Querying older than 30 days requires a paid plan" -> 30 günden
+    #      eski tarih sorgulanamıyor.
+    #   2) "Timeframe queries exceeding 5 days require a paid plan" -> tek
+    #      istekteki start/end aralığı en fazla 5 gün olabiliyor.
+    # Bu ikinci sınır, geniş bir aralığı tek istekle çekip günlük/haftalık
+    # ihtiyacı birlikte karşılama planını (365 günlük istek) tamamen
+    # geçersiz kılıyor. Pratik sonuç:
+    #   - "1day" (Günlük/Haftalık/Aylık için kaynak): sadece son birkaç
+    #     güne sığan, güvenli 4 günlük bir pencere denenir. Bu genelde
+    #     Günlük'ü karşılar; Haftalık/Aylık için yeterli olmayabilir ama en
+    #     azından API hata vermeden düzgün "veri yok" ile sonuçlanır.
+    #   - "1week" (6 Aylık/Yıllık için kaynak): haftalık toplulaştırma aylar
+    #     sürecek geniş bir aralık gerektirir, 5 günlük pencereye asla
+    #     sığmaz. Boşuna kota/ağ harcamamak için istek hiç atılmadan direkt
+    #     hata döndürülür; sıradaki kaynağa (Stooq) geçilir.
+    FREE_PLAN_MAX_RANGE_DAYS = METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS
+
+    if interval == "1week":
+        raise ValueError(
+            "MetalpriceAPI ücretsiz planında tek seferde en fazla 5 günlük "
+            "aralık sorgulanabiliyor; haftalık toplulaştırma için yetersiz "
+            "(ücretli plan gerekiyor)."
+        )
+
+    today = datetime.now(TR_TZ).date()
+    days_needed = FREE_PLAN_MAX_RANGE_DAYS
+    start_date = today - timedelta(days=days_needed)
+    # Free planda güncel günün verisi henüz gelmemiş olabilir (bir gün gecikmeli).
+    end_date = today - timedelta(days=1)
+
+    params = {
+        "api_key": METALPRICEAPI_KEY,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "base": "USD",
+        "currencies": metal_code,
     }
 
-
-def format_para(deger, para_birimi="TL"):
-    """TL için Türk formatı (1.234,56), USD için standart format (1,234.56)."""
-    if para_birimi == "TL":
-        return f"{deger:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    else:
-        return f"{deger:,.2f}"
-
-
-# --- GÜNLÜK ÖNBELLEK (CACHE) — artık Redis tabanlı ve KALICI ---
-# Amaç: Aynı hisse için aynı gün içinde tekrar sorulduğunda TUTARLI sonuç
-# vermek. isyatirim bazen tam veri (gerçek TTM) döndürüyor, bazen zaman
-# aşımına uğrayıp kaba tahmine düşülüyordu — bu da aynı hisse için farklı
-# sorgularda FARKLI sonuçlar çıkmasına yol açıyordu.
-# Mantık: Sadece GERÇEK TTM ile başarılı olan sonuçlar önbelleğe alınır
-# (ttm_gercek=True). Kaba tahminle biten sonuçlar önbelleğe ALINMAZ —
-# böylece isyatirim daha sonra toparlanırsa, bir sonraki sorguda yine
-# gerçek veriyi yakalama şansı kalır. Fiyat her zaman canlı çekilir,
-# sadece bilanço/gelir tablosu kalemleri önbelleklenir.
-#
-# DÜZELTME: Eskiden bu, sürecin kendi belleğindeki sıradan bir Python
-# sözlüğüydü (_GUNLUK_ONBELLEK = {}) — Railway her redeploy/restart
-# yaptığında (crash sonrası kendi kendine yeniden başlatma dahil) bu
-# sözlük sıfırlanıyor, "kalıcı" olması gereken önbellek aslında hiç
-# kalıcı olmuyordu. Artık Railway'in sağladığı REDIS_URL ortam
-# değişkeni üzerinden ayrı bir Redis servisine yazılıyor — bot yeniden
-# başlasa bile önbellek verisi Redis'te kalmaya devam ediyor.
-# Redis'e her nedenle ulaşılamazsa (env değişkeni eksik, bağlantı
-# hatası vb.) kod BOZULMUYOR — sessizce eski bellek-içi sözlüğe
-# düşüyor, bot çökmeden çalışmaya devam ediyor.
-REDIS_URL = os.environ.get("REDIS_URL")
-_redis_client = None
-if REDIS_URL:
     try:
-        _redis_client = redis.from_url(
-            REDIS_URL, decode_responses=True,
-            socket_connect_timeout=5, socket_timeout=5,
+        resp = requests.get(METALPRICEAPI_URL, params=params, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        raise ValueError(f"MetalpriceAPI'ye bağlanılamadı: {e}")
+
+    if not data.get("success"):
+        err = data.get("error", {})
+        raise ValueError(f"MetalpriceAPI hata: {err.get('info', data)}")
+
+    usd_key = f"USD{metal_code}"
+    daily_bars = []
+    for date_str, values in sorted((data.get("rates") or {}).items()):
+        price = values.get(usd_key)
+        if price is None:
+            continue
+        price = float(price)
+        # Bu kaynak sadece tek bir günlük fiyat verir (OHLC değil); high/low
+        # olarak aynı değeri kullanıyoruz (BIST endeksleri için de aynı
+        # yaklaşım zaten uygulanıyor).
+        daily_bars.append({"datetime": date_str, "high": price, "low": price, "close": price})
+
+    if not daily_bars:
+        raise ValueError(f"MetalpriceAPI: '{user_symbol}' için veri bulunamadı.")
+
+    # NOT: "1week" durumu artık bu fonksiyona hiç gelmiyor (yukarıda erken
+    # raise ediliyor), bu yüzden burada sadece günlük bar döndürülür.
+    return daily_bars[-outputsize:] if len(daily_bars) > outputsize else daily_bars
+
+
+def fetch_bars_metalpriceapi(user_symbol: str, interval: str, outputsize: int):
+    """MetalpriceAPI çağrısını önbellekle sarmalar (100 istek/ay kotasını korumak için).
+
+    DÜZELTME: MetalpriceAPI ücretsiz planı bir istekte en fazla
+    ~METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS gün verebiliyor. Daha önce bu
+    fonksiyon `outputsize` ne olursa olsun (ör. Haftalık/Aylık için istenen
+    30-60 gün) "başarıyla" birkaç barlık eksik veri döndürüyordu; fetch_bars()
+    de bunu "kaynak başarılı oldu" sayıp Stooq/yfinance'e hiç geçmiyordu.
+    Sonuç: Haftalık ve Aylık, aynı dar 3-4 günlük pencereden hesaplandığı
+    için birbirinin birebir kopyası çıkıyordu.
+    Bu yüzden istenen outputsize, kaynağın gerçekten karşılayabileceğinden
+    büyükse, veri çekmeyi hiç denemeden erken hata fırlatıp bir sonraki
+    kaynağa (Stooq/yfinance) geçilmesini sağlıyoruz.
+    """
+    if outputsize > METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS + 1:
+        raise ValueError(
+            f"MetalpriceAPI ücretsiz planı tek istekte en fazla "
+            f"~{METALPRICEAPI_FREE_PLAN_MAX_RANGE_DAYS} günlük veri "
+            f"verebiliyor; istenen {outputsize} gün için yetersiz "
+            f"(Haftalık/Aylık gibi daha uzun geçmiş gerektiren periyotlar "
+            f"için bu kaynak atlanıp sıradakine geçilecek)."
         )
-        _redis_client.ping()
-        print("✅ Redis bağlantısı başarılı — önbellek artık KALICI (Railway restart'larında da korunur).")
-    except Exception as e:
-        print(f"⚠️ Redis'e bağlanılamadı, bellek-içi (geçici) önbelleğe düşülüyor: {e}")
-        _redis_client = None
-else:
-    print("⚠️ REDIS_URL ortam değişkeni bulunamadı, bellek-içi (geçici) önbellek kullanılacak.")
-
-# Redis yoksa/erişilemezse bot yine de çalışsın diye yedek bellek-içi sözlük
-_GUNLUK_ONBELLEK_YEDEK = {}
-
-# Önbellek kaydının Redis'te ne kadar süre tutulacağı (saniye).
-# 26 saat: "günlük" mantığa 2 saatlik güvenlik payı eklendi (sunucu
-# saat dilimi kaymaları / gece yarısı sınır durumları için).
-_ONBELLEK_TTL_SANIYE = 26 * 60 * 60
+    cache_key = f"metalpriceapi:{user_symbol.strip().upper()}:{interval}:{outputsize}"
+    return _cached_fetch(cache_key, lambda: _fetch_bars_metalpriceapi_uncached(user_symbol, interval, outputsize))
 
 
-def _onbellek_anahtari(hisse_kodu):
-    # Redis anahtarları string olmalı (eskiden tuple kullanılıyordu).
-    return f"bist_bot:{hisse_kodu}:{date.today().isoformat()}"
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - YEDEK KAYNAK: Stooq (MetalpriceAPI de başarısız/uygun değilse)
+# ----------------------------------------------------------------------------
 
+def _fetch_bars_stooq_uncached(user_symbol: str, interval: str, outputsize: int):
+    """
+    Yedek veri kaynağı. Sadece Twelve Data 'UPGRADE_REQUIRED' hatası
+    verdiğinde (ücretsiz planda kapalı semboller için) çağrılır.
+    Stooq'ta gün-içi (4 saatlik) veri YOKTUR, sadece günlük/haftalık.
+    NOT: Stooq'un resmi API'si yoktur, bu basit CSV linkine dayanır;
+    bazı semboller (özellikle DXY) garantili çalışmayabilir. Ayrıca
+    User-Agent'sız isteklerde sıkça "Too Many Requests" ile rate limit
+    uygular; bu yüzden tarayıcı benzeri header'lar gönderiyoruz.
+    """
+    if interval == "4h":
+        raise ValueError("Stooq kaynağında 4 saatlik veri yok.")
 
-def _onbellek_oku(anahtar):
-    if _redis_client:
-        try:
-            ham = _redis_client.get(anahtar)
-            if ham:
-                return json.loads(ham)
-            return None
-        except Exception as e:
-            print(f"⚠️ Redis okuma hatası ({anahtar}): {e}")
-            # Redis'e ulaşılamadıysa yedek sözlüğe bak
-    return _GUNLUK_ONBELLEK_YEDEK.get(anahtar)
+    stooq_interval = "w" if interval == "1week" else "d"
+    symbol = _normalize_stooq_symbol(user_symbol)
+    url = f"https://stooq.com/q/d/l/?s={symbol}&i={stooq_interval}"
 
-
-def _onbellek_yaz(anahtar, veri):
-    if _redis_client:
-        try:
-            _redis_client.set(anahtar, json.dumps(veri), ex=_ONBELLEK_TTL_SANIYE)
-            return
-        except Exception as e:
-            print(f"⚠️ Redis yazma hatası ({anahtar}): {e}, bellek-içi yedeğe yazılıyor")
-    _GUNLUK_ONBELLEK_YEDEK[anahtar] = veri
-
-
-# --- 1a. BIST VERİ ÇEKME (isyatirimhisse ile) ---
-def get_bist_data(hisse_kodu):
-    if hisse_kodu in BANKALAR:
-        return {"hata": (
-            f"{hisse_kodu} bir banka hissesi. Bankalar farklı bir mali "
-            f"tablo formatı (UFRS) kullandığı için bu bot şu an banka "
-            f"analizini desteklemiyor. Yanlış kalem eşleşmesiyle hatalı "
-            f"sonuç üretmektense bu özelliği henüz devre dışı bıraktık."
-        )}
-
-    # --- YENİ: ÖNBELLEK KONTROLÜ ---
-    # Bugün bu hisse için daha önce GERÇEK TTM ile başarılı bir sonuç
-    # alındıysa, isyatirim'e tekrar gitmeden onu kullan. Sadece fiyatı
-    # canlı güncelle (fiyat her an değişebilir, bilanço günlük değişmez).
-    onbellek_anahtar = _onbellek_anahtari(hisse_kodu)
-    onbellek_veri = _onbellek_oku(onbellek_anahtar)
-    if onbellek_veri is not None:
-        onbellek_veri = dict(onbellek_veri)  # kopya al
-        print(f"💾 [{hisse_kodu}] Önbellekten kullanılıyor (bugün zaten gerçek TTM ile çekilmişti)")
-        try:
-            ticker_fiyat = yf.Ticker(hisse_kodu + ".IS")
-            hist = ticker_fiyat.history(period="1d")
-            if hist is not None and not hist.empty:
-                onbellek_veri['fiyat'] = round(float(hist['Close'].iloc[-1]), 2)
-        except Exception as e:
-            print(f"⚠️ [{hisse_kodu}] Önbellek fiyat güncellemesi başarısız, eski fiyat kullanılıyor: {e}")
-        return onbellek_veri
-
-    # --- YENİ: ZAMANLAMA ÖLÇÜMÜ ---
-    # Hangi ağ çağrısının yavaşlığa sebep olduğunu görmek için her adımı
-    # ayrı ayrı ölçüyoruz. Bu print'ler Railway loglarında görünür.
-    _t0 = time.time()
-
-    # --- DÜZELTME: FİYAT ÇEKME ARTIK TUTARLI ---
-    # Eskiden: önce fast_info denenir, o boşsa history()'e düşülürdü.
-    # Sorun: fast_info Yahoo'nun BIST hisselerinde bazen ESKİ/önbelleklenmiş
-    # bir değer döndürüyor (None olmadığı için history() denemesine hiç
-    # geçilmiyordu), bu da aynı hisse için art arda yapılan çağrılarda
-    # FARKLI fiyatlar görülmesine yol açıyordu. Artık her zaman history()'i
-    # (son kapanış/gün içi son fiyat) birincil kaynak olarak kullanıyoruz —
-    # bu, fast_info'ya göre çok daha stabil/tutarlı davranıyor. fast_info
-    # sadece history() de başarısız olursa yedek olarak deneniyor.
-    ticker = yf.Ticker(hisse_kodu + ".IS")
-    guncel_fiyat = None
     try:
-        hist = ticker.history(period="1d")
-        if hist is not None and not hist.empty:
-            guncel_fiyat = float(hist['Close'].iloc[-1])
+        resp = requests.get(url, headers=BROWSER_HEADERS, timeout=15)
     except Exception as e:
-        print(f"⚠️ [{hisse_kodu}] history() başarısız: {e}")
+        raise ValueError(f"Stooq'a bağlanılamadı: {e}")
 
-    if guncel_fiyat is None:
+    text = resp.text.strip()
+
+    if _is_rate_limit_text(text) or resp.status_code == 429:
+        raise ValueError(
+            "Stooq şu anda istek limiti uyguluyor (Too Many Requests). "
+            "Lütfen birkaç dakika sonra tekrar deneyin."
+        )
+
+    lines_ = text.splitlines()
+    if not lines_ or "Date" not in lines_[0]:
+        preview = text[:200].replace("\n", " ")
+        raise ValueError(
+            f"Stooq: '{user_symbol}' için veri alınamadı "
+            f"(sembol desteklenmiyor ya da günlük istek limiti dolmuş olabilir. "
+            f"Dönen içerik: {preview!r})"
+        )
+
+    bars = []
+    for line in lines_[1:]:
+        parts = line.split(",")
+        if len(parts) < 5:
+            continue
         try:
-            fi = ticker.fast_info['lastPrice']
-            if fi is not None:
-                guncel_fiyat = float(fi)
-        except Exception as e:
-            print(f"⚠️ [{hisse_kodu}] fast_info yedek deneme de başarısız: {e}")
+            bar = {
+                "datetime": parts[0],
+                "high": float(parts[2]),
+                "low": float(parts[3]),
+            }
+            if len(parts) > 4 and parts[4]:
+                bar["close"] = float(parts[4])
+            bars.append(bar)
+        except ValueError:
+            continue
 
-    print(f"⏱️ [{hisse_kodu}] fiyat çekme: {time.time() - _t0:.2f}s (sonuç: {guncel_fiyat})")
+    if not bars:
+        raise ValueError(f"Stooq: '{user_symbol}' için ayrıştırılabilir veri bulunamadı.")
 
-    _t1 = time.time()
-    try:
-        temettu_hisse_basi = ticker.info.get('dividendRate')
-    except Exception:
-        temettu_hisse_basi = None
-    print(f"⏱️ [{hisse_kodu}] ticker.info (temettü): {time.time() - _t1:.2f}s")
+    return bars[-outputsize:] if len(bars) > outputsize else bars
 
-    _t2 = time.time()
-    guncel_yil = datetime.now().year
 
-    # --- YENİ: VERİ BÜTÜNLÜĞÜ KONTROLÜ ---
-    # Sadece "df boş değil" kontrolü yeterli değildi — isyatirim bazen
-    # dolu ama EKSİK bir yanıt döndürüyor (örn. en güncel çeyrek sütunu
-    # hiç gelmemiş, veri 1-2 dönem geride kalmış). Bu durumda kod sessizce
-    # eski bir dönemi "en güncel" sanıyordu (FROTO'da aynı gün içinde
-    # 2026/3 ile 2025/12 arasında gidip gelen sonuçların asıl sebebi buydu).
-    # Bu fonksiyon, gelen yanıtta net kâr (3L) kalemi gerçekten dolu mu
-    # diye kontrol ediyor; değilse yanıtı "eksik" sayıp tekrar deniyoruz.
-    def _donem_anahtari_ic(kolon):
-        try:
-            y, a = str(kolon).split("/")
-            return (int(y), int(a))
-        except Exception:
-            return (0, 0)
+def fetch_bars_stooq(user_symbol: str, interval: str, outputsize: int):
+    """Stooq çağrısını kısa süreli önbellekle sarmalar (rate limit'i azaltmak için)."""
+    cache_key = f"stooq:{user_symbol.strip().upper()}:{interval}:{outputsize}"
+    return _cached_fetch(cache_key, lambda: _fetch_bars_stooq_uncached(user_symbol, interval, outputsize))
 
-    def _kolon_bul(hedef_str, kolonlar):
-        """
-        Elle oluşturulan bir sütun ismini ('2025/12' gibi bir Python string'i)
-        gerçek DataFrame sütunlarıyla eşleştirir. Doğrudan '==' karşılaştırması
-        bazen sessizce başarısız oluyordu (sütunlar görünüşte aynı yazsa da
-        farklı bir iç veri tipinde olabiliyor) — bu yüzden str() çevrimiyle
-        karşılaştırıyoruz, tipten bağımsız hale getiriyoruz. TTM hesabının
-        THYAO'da sürekli "geçmiş yıl bulunamadı"ya düşmesinin asıl sebebi
-        tam olarak buydu.
-        """
-        for c in kolonlar:
-            if str(c) == str(hedef_str):
-                return c
-        return None
 
-    def _beklenen_min_donem():
-        """
-        Bugünün tarihine göre, BIST'te en geç yayınlanmış olması GEREKEN
-        çeyreği hesaplar (yaklaşık 75 günlük raporlama gecikme payıyla).
-        Örnek: Bugün 29 Temmuz 2026 ise, 2026/3 (31 Mart bitişli çeyrek)
-        75 gün önce (yaklaşık 14 Haziran 2026) yayınlanmış olması
-        gerektiğinden "beklenen minimum dönem" 2026/3 olur.
-        """
-        bugun = date.today()
-        adaylar = []
-        for yil_ad in [bugun.year, bugun.year - 1]:
-            for (ay, gun) in [(3, 31), (6, 30), (9, 30), (12, 31)]:
-                try:
-                    ceyrek_sonu = date(yil_ad, ay, gun)
-                except ValueError:
-                    continue
-                yayin_tahmini = ceyrek_sonu + timedelta(days=75)
-                if yayin_tahmini <= bugun:
-                    adaylar.append((yil_ad, ay))
-        return max(adaylar) if adaylar else (0, 0)
+# ----------------------------------------------------------------------------
+# VERİ ÇEKME - 2. YEDEK KAYNAK: Yahoo Finance (yfinance)
+# ----------------------------------------------------------------------------
+# Sadece Twelve Data VE Stooq ikisi de başarısız olursa denenir.
+# yfinance'te gün-içi (4 saatlik) veri bu botun ihtiyacına uygun şekilde
+# YOKTUR (destekli değildir), sadece günlük/haftalık.
 
-    def _veri_butun_mu(kontrol_df):
-        if kontrol_df is None or kontrol_df.empty:
-            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: DataFrame boş/None")
-            return False
-        sutunlar = [
-            c for c in kontrol_df.columns
-            if c not in ['FINANCIAL_ITEM_CODE', 'FINANCIAL_ITEM_NAME_TR', 'FINANCIAL_ITEM_NAME_EN', 'SYMBOL']
-            and "/" in str(c)
-        ]
-        if not sutunlar:
-            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: hiç dönem sütunu bulunamadı. Ham sütunlar: {list(kontrol_df.columns)}")
-            return False
-        sutunlar.sort(key=_donem_anahtari_ic)
-        son_sutun = sutunlar[-1]
-        print(f"🔎 [{hisse_kodu}] _veri_butun_mu: bulunan dönem sütunları: {[str(s) for s in sutunlar]}, son_sutun: {son_sutun} (tip: {type(son_sutun)})")
+YFINANCE_INTERVAL_MAP = {"1day": "1d", "1week": "1wk"}
 
-        # --- TAZELİK KONTROLÜ: en güncel çeyrek gerçekten geldi mi? ---
-        beklenen = _beklenen_min_donem()
-        if beklenen != (0, 0) and _donem_anahtari_ic(son_sutun) < beklenen:
-            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TAZELİK başarısız — son_sutun={_donem_anahtari_ic(son_sutun)}, beklenen={beklenen}")
-            return False
+# Bazı metal/emtia sembolleri Yahoo'da forex çifti (ör. XAGUSD=X) olarak
+# çalışmıyor veya yfinance'te tuhaf iç hatalara (ör. NoneType) yol açıyor;
+# bu yüzden bu sembollerde doğrudan en yakın vadeli işlem kontratına düşülür
+# (spota çok yakın hareket eder).
+YFINANCE_FUTURES_FALLBACK = {
+    "XAGUSD": "SI=F",   # Gümüş vadeli
+    "XPTUSD": "PL=F",   # Platin vadeli
+    "XPDUSD": "PA=F",   # Paladyum vadeli
+}
 
-        seri = kontrol_df[kontrol_df['FINANCIAL_ITEM_CODE'] == '3L']
-        if seri.empty:
-            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: FINANCIAL_ITEM_CODE=='3L' satırı hiç yok")
-            return False
-        try:
-            deger = seri[son_sutun].values[0]
-            if deger is None or str(deger).strip() in ('', 'nan', 'None'):
-                print(f"🔴 [{hisse_kodu}] _veri_butun_mu: son_sutun ({son_sutun}) için 3L değeri boş/None: {deger!r}")
-                return False
-        except Exception as e:
-            print(f"🔴 [{hisse_kodu}] _veri_butun_mu: son_sutun okurken hata: {e}")
-            return False
+# NOT: yfinance'e dışarıdan sade bir requests.Session vermek, kütüphanenin
+# kendi iç kimlik doğrulama (crumb/cookie) mekanizmasını devre dışı bırakıp
+# TÜM istekleri "Too Many Requests" gibi görünen kalıcı bir hataya
+# sokabiliyor. Bu yüzden burada session'ı KASITLI OLARAK yfinance'in kendi
+# varsayılan yönetimine bırakıyoruz (session parametresi vermiyoruz).
 
-        # --- YENİ: TTM GEÇMİŞ YIL KONTROLÜ ---
-        # Sadece en güncel çeyreğin gelmesi yetmiyor — TTM hesaplaması
-        # (Bu yıl + Geçen yılın tamamı - Geçen yılın aynı dönemi) için
-        # geçmiş yıl verilerinin de eksiksiz gelmesi gerekiyor. Bu kontrol
-        # olmadan, isyatirim geçmiş yıl verisini eksik döndürdüğünde kod
-        # bunu "tamam" sanıyor ve sessizce kaba ×4 yöntemine düşüyordu —
-        # bu da aynı hisse için farklı zamanlarda FARKLI (bazen gerçek TTM,
-        # bazen kaba tahmin) sonuçlar çıkmasının asıl sebebiydi.
-        yil_donem, ay_donem = _donem_anahtari_ic(son_sutun)
-        if ay_donem != 12 and ay_donem != 0:  # yıllık değilse TTM'ye ihtiyaç var
-            onceki_tam_yil_kolon = _kolon_bul(f"{yil_donem - 1}/12", sutunlar)
-            ayni_donem_gecen_yil_kolon = _kolon_bul(f"{yil_donem - 1}/{ay_donem}", sutunlar)
-            print(f"🔎 [{hisse_kodu}] TTM arıyor: aranan='{yil_donem-1}/12' bulunan={onceki_tam_yil_kolon!r} | aranan='{yil_donem-1}/{ay_donem}' bulunan={ayni_donem_gecen_yil_kolon!r}")
-            if onceki_tam_yil_kolon is None or ayni_donem_gecen_yil_kolon is None:
-                print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TTM için geçmiş yıl sütunları bulunamadı")
-                return False  # geçmiş yıl sütunları hiç yok, eksik say
+
+def _normalize_yfinance_symbol(user_symbol: str) -> str:
+    """'BTCUSD' -> 'BTC-USD', 'XAUUSD' -> 'XAUUSD=X' gibi Yahoo Finance formatına çevirir."""
+    s = user_symbol.strip().upper().replace(" ", "").replace("/", "")
+    if len(s) > 3:
+        base, quote = s[:-3], s[-3:]
+        if base in CRYPTO_BASES:
+            return f"{base}-{quote}"
+    return f"{s}=X"
+
+
+def _fetch_bars_yfinance_uncached(user_symbol: str, interval: str, outputsize: int):
+    """2. yedek veri kaynağı. Sadece Twelve Data VE Stooq başarısız olursa çağrılır.
+    Yahoo da rate-limit uyguladığından basit bir retry/backoff eklendi."""
+    if interval not in YFINANCE_INTERVAL_MAP:
+        raise ValueError("yfinance kaynağında bu aralık (4 saatlik) desteklenmiyor.")
+
+    if yf is None:
+        raise ValueError("yfinance kütüphanesi kurulu değil (pip install yfinance).")
+
+    yf_interval = YFINANCE_INTERVAL_MAP[interval]
+    normalized_input = user_symbol.strip().upper().replace(" ", "")
+
+    candidates = [_normalize_yfinance_symbol(user_symbol)]
+    if normalized_input in YFINANCE_FUTURES_FALLBACK:
+        candidates.append(YFINANCE_FUTURES_FALLBACK[normalized_input])
+
+    # outputsize'ın üstüne, hafta sonu/tatil kayıplarını telafi etmek için pay bırakılır.
+    days_multiplier = 7 if yf_interval == "1wk" else 2
+    period_days = min(outputsize * days_multiplier + 30, 3650)
+
+    last_err = None
+    rate_limited = False
+    max_attempts = 3
+
+    for candidate in candidates:
+        for attempt in range(max_attempts):
             try:
-                onceki_deger = seri[onceki_tam_yil_kolon].values[0]
-                ayni_donem_deger = seri[ayni_donem_gecen_yil_kolon].values[0]
-                print(f"🔎 [{hisse_kodu}] TTM geçmiş yıl değerleri: onceki_tam={onceki_deger!r}, ayni_donem={ayni_donem_deger!r}")
-                if (onceki_deger is None or str(onceki_deger).strip() in ('', 'nan', 'None') or
-                        ayni_donem_deger is None or str(ayni_donem_deger).strip() in ('', 'nan', 'None')):
-                    print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TTM geçmiş yıl değerleri boş/None")
-                    return False
+                df = yf.Ticker(candidate).history(
+                    period=f"{period_days}d",
+                    interval=yf_interval,
+                    auto_adjust=False,
+                )
+                if df is None or df.empty:
+                    last_err = ValueError(f"'{candidate}' için veri dönmedi.")
+                    break  # boş veri retry ile düzelmez, sonraki adaya geç
+
+                bars = []
+                for idx, row in df.iterrows():
+                    try:
+                        bars.append({
+                            "datetime": idx.strftime("%Y-%m-%d"),
+                            "high": float(row["High"]),
+                            "low": float(row["Low"]),
+                            "close": float(row["Close"]),
+                        })
+                    except (TypeError, ValueError):
+                        continue
+
+                if not bars:
+                    last_err = ValueError(f"'{candidate}' için ayrıştırılabilir veri yok.")
+                    break
+
+                return bars[-outputsize:] if len(bars) > outputsize else bars
+
             except Exception as e:
-                print(f"🔴 [{hisse_kodu}] _veri_butun_mu: TTM geçmiş yıl okurken hata: {e}")
-                return False
+                last_err = e
+                if _is_rate_limit_text(str(e)):
+                    rate_limited = True
+                    # Basit üstel bekleme: 1.5s, 3s, 4.5s
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                break  # rate limit dışı bir hata ise tekrar denemenin anlamı yok
 
-        print(f"🟢 [{hisse_kodu}] _veri_butun_mu: TÜM KONTROLLER GEÇTİ, veri tam kabul edildi (son_sutun={son_sutun})")
-        return True
+    if rate_limited:
+        raise ValueError(
+            "Yahoo Finance şu anda istek limiti uyguluyor (Too Many Requests). "
+            "Lütfen birkaç dakika sonra tekrar deneyin."
+        )
+    raise ValueError(f"yfinance: '{user_symbol}' için veri alınamadı ({last_err}).")
 
-    # --- RETRY MANTIĞI ---
-    # isyatirim.com.tr sunucusu bazen geçici olarak yavaşlıyor/zaman aşımına
-    # uğruyor (Railway loglarında "Read timed out" görüldü). Tek seferde
-    # pes etmek yerine kısa bir bekleme ile 3 kez deniyoruz — çoğu zaman
-    # ikinci veya üçüncü denemede sunucu tam/eksiksiz cevap veriyor.
-    df = None
-    MAX_DENEME = 4
-    for deneme in range(1, MAX_DENEME + 1):
+
+def fetch_bars_yfinance(user_symbol: str, interval: str, outputsize: int):
+    """yfinance çağrısını kısa süreli önbellekle sarmalar (rate limit'i azaltmak için)."""
+    cache_key = f"yfinance:{user_symbol.strip().upper()}:{interval}:{outputsize}"
+    return _cached_fetch(cache_key, lambda: _fetch_bars_yfinance_uncached(user_symbol, interval, outputsize))
+
+
+# ----------------------------------------------------------------------------
+# ANA fetch_bars FONKSİYONU
+# ----------------------------------------------------------------------------
+
+# 1 ons = 31.1034768 gram. XAUTRYG (Gram Altın/TL) hiçbir sağlayıcıda tek bir
+# sembol olarak bulunmuyor; (XAU/USD / 31.1034768) * USD/TRY formülüyle
+# TÜRETİLİR.
+GRAMS_PER_TROY_OUNCE = 31.1034768
+
+
+def fetch_bars(user_symbol: str, interval: str, outputsize: int):
+    """
+    Sıralama:
+      1) XAUTRYG -> XAUUSD ve USDTRY üzerinden TÜRETİLİR.
+      2) XU100/XU030/XU500 -> doğrudan isyatirimhisse (İş Yatırım).
+      3) Diğer her şey -> önce Twelve Data; 'UPGRADE_REQUIRED' hatası
+         alırsa (ücretsiz planda kapalı sembol) sırasıyla:
+         MetalpriceAPI (sadece XAG/XPT/XPD için) -> Stooq -> yfinance denenir.
+    """
+    normalized_input = user_symbol.strip().upper().replace(" ", "")
+
+    if normalized_input in ("XAUTRYG", "GRAMALTIN"):
+        # Formül: (XAUUSD / 31.1034768) * USDTRY
+        xau_bars = fetch_bars("XAUUSD", interval, outputsize)
+        usdtry_bars = fetch_bars("USDTRY", interval, outputsize)
+        usdtry_by_date = {b["datetime"]: b for b in usdtry_bars}
+
+        result = []
+        for xb in xau_bars:
+            ub = usdtry_by_date.get(xb["datetime"])
+            if ub is None:
+                continue  # o tarihte eşleşen USDTRY verisi yoksa bu günü atla
+            xb_close = xb.get("close", (float(xb["high"]) + float(xb["low"])) / 2)
+            ub_close = ub.get("close", (float(ub["high"]) + float(ub["low"])) / 2)
+            result.append({
+                "datetime": xb["datetime"],
+                "high": (float(xb["high"]) / GRAMS_PER_TROY_OUNCE) * float(ub["high"]),
+                "low": (float(xb["low"]) / GRAMS_PER_TROY_OUNCE) * float(ub["low"]),
+                "close": (float(xb_close) / GRAMS_PER_TROY_OUNCE) * float(ub_close),
+            })
+
+        if not result:
+            raise ValueError("XAUTRYG için XAUUSD ve USDTRY tarihleri eşleştirilemedi.")
+        return result
+
+    if normalized_input in BIST_INDEX_ALIASES:
+        return fetch_bars_bist_index(user_symbol, interval, outputsize)
+
+    try:
+        return fetch_bars_twelvedata(user_symbol, interval, outputsize)
+    except ValueError as e:
+        if str(e) != "UPGRADE_REQUIRED":
+            raise
+
+    logger.info(f"🔄 '{user_symbol}' Twelve Data ücretsiz planda kapalı, yedek kaynaklar deneniyor...")
+
+    fallback_sources = []
+    if normalized_input in METALPRICEAPI_SYMBOL_MAP and METALPRICEAPI_KEY:
+        fallback_sources.append(("MetalpriceAPI", fetch_bars_metalpriceapi))
+    fallback_sources.append(("Stooq", fetch_bars_stooq))
+    fallback_sources.append(("yfinance", fetch_bars_yfinance))
+
+    errors = []
+    for name, fetch_fn in fallback_sources:
         try:
-            aday_df = isyatirimhisse.FetchFinancials.fetch_financials(
-                hisse_kodu,
-                start_year=guncel_yil - 1,
-                end_year=guncel_yil,
-            )
-            if _veri_butun_mu(aday_df):
-                df = aday_df
-                break
-            else:
-                print(f"⚠️ [{hisse_kodu}] deneme {deneme}/{MAX_DENEME}: veri eksik/boş geldi, tekrar denenecek")
-                df = aday_df  # en azından son alınanı sakla, hepsi başarısız olursa yine de kullanılabilir
-        except Exception as e:
-            print(f"⚠️ [{hisse_kodu}] isyatirim deneme {deneme}/{MAX_DENEME} başarısız: {e}")
-        if deneme < MAX_DENEME:
-            time.sleep(2)  # sunucuya nefes alma payı bırak
-    print(f"⏱️ [{hisse_kodu}] isyatirim fetch_financials ({deneme} deneme): {time.time() - _t2:.2f}s")
-    if df is None or guncel_fiyat is None:
-        return None
+            return fetch_fn(user_symbol, interval, outputsize)
+        except Exception as source_err:
+            logger.warning(f"🔄 '{user_symbol}' {name} başarısız oldu, sıradaki deneniyor... ({source_err})")
+            errors.append(f"{name} ({source_err})")
 
-    donem_sutunlari = []
-    for col in df.columns:
-        if col not in ['FINANCIAL_ITEM_CODE', 'FINANCIAL_ITEM_NAME_TR', 'FINANCIAL_ITEM_NAME_EN', 'SYMBOL']:
-            if "/" in str(col):
-                donem_sutunlari.append(col)
+    raise ValueError(
+        f"Twelve Data ücretsiz planda kapalı; " + "; ".join(errors) + " denemeleri de başarısız oldu."
+    )
 
-    # --- DÜZELTME: KRONOLOJİK SIRALAMA ---
-    # Eskiden donem_sutunlari[-1] (API'nin döndürdüğü son sütun) "en güncel
-    # dönem" varsayılıyordu. Ama isyatirim'in yanıtı ara sıra eksik/kesik
-    # geldiğinde (bkz. Railway loglarındaki "Read timed out" uyarıları),
-    # sütunların sırası değişebiliyor veya en güncel çeyrek (örn. 2026/3)
-    # hiç gelmeyip veri 2025/12'de kalabiliyor — bu da aynı hisse için art
-    # arda yapılan çağrılarda FARKLI dönemlerin seçilmesine (ve dolayısıyla
-    # farklı HBK/Graham/adil değer sonuçlarına) yol açıyordu.
-    # Artık sütunlar "yıl/ay" değerine göre GERÇEKTEN sayısal olarak
-    # sıralanıyor, API'nin döndürme sırasına güvenilmiyor.
-    def _donem_anahtari(kolon):
-        try:
-            y, a = str(kolon).split("/")
-            return (int(y), int(a))
-        except Exception:
-            return (0, 0)
 
-    donem_sutunlari.sort(key=_donem_anahtari)
+# ----------------------------------------------------------------------------
+# DÖNEM SINIRLARI (son TAMAMLANMIŞ hafta / ay / yarıyıl / yıl)
+# ----------------------------------------------------------------------------
 
-    if donem_sutunlari:
-        latest_col = donem_sutunlari[-1]
+def get_last_completed_week_range(today: date, is_crypto: bool = False):
+    weekday = today.weekday()
+
+    if is_crypto:
+        this_monday = today - timedelta(days=weekday)
+        last_monday = this_monday - timedelta(days=7)
+        last_sunday = last_monday + timedelta(days=6)
+        return last_monday, last_sunday
+
+    if weekday >= 5:
+        week_monday = today - timedelta(days=weekday)
     else:
-        latest_col = df.columns[-2]
+        this_monday = today - timedelta(days=weekday)
+        week_monday = this_monday - timedelta(days=7)
 
-    ozsermaye_temp = df[df['FINANCIAL_ITEM_CODE'] == '2O'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2O'].empty else 0
-    donen_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1A'].empty else 0
-    duran_varliklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AK'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AK'].empty else 0
-    kisa_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2A'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2A'].empty else 0
-    # --- /debug ile bulunan gerçek kodlar ---
-    stoklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AF'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AF'].empty else 0
-    ticari_alacaklar_temp = df[df['FINANCIAL_ITEM_CODE'] == '1AC'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1AC'].empty else 0
-    toplam_varliklar_gercek_temp = df[df['FINANCIAL_ITEM_CODE'] == '1BL'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '1BL'].empty else 0
-    uzun_vadeli_borc_temp = df[df['FINANCIAL_ITEM_CODE'] == '2B'][latest_col].values[0] if not df[df['FINANCIAL_ITEM_CODE'] == '2B'].empty else 0
+    week_friday = week_monday + timedelta(days=4)
+    return week_monday, week_friday
 
-    _t3 = time.time()
-    toplam_hisse = ticker.info.get('sharesOutstanding')
-    print(f"⏱️ [{hisse_kodu}] ticker.info (hisse adedi): {time.time() - _t3:.2f}s")
-    if not toplam_hisse or toplam_hisse <= 0:
+
+def get_last_completed_month_range(today: date):
+    first_of_this_month = today.replace(day=1)
+    last_day_prev_month = first_of_this_month - timedelta(days=1)
+    first_day_prev_month = last_day_prev_month.replace(day=1)
+    return first_day_prev_month, last_day_prev_month
+
+
+def get_last_completed_half_year_range(today: date):
+    year = today.year
+    if today.month <= 6:
+        return date(year - 1, 7, 1), date(year - 1, 12, 31)
+    return date(year, 1, 1), date(year, 6, 30)
+
+
+def get_last_completed_year_range(today: date):
+    last_year = today.year - 1
+    return date(last_year, 1, 1), date(last_year, 12, 31)
+
+
+# ----------------------------------------------------------------------------
+# HEDEF DÖNEM SINIRLARI
+# ----------------------------------------------------------------------------
+# Denge aralığı mantığı: bir önceki TAMAMLANMIŞ dönemin (gün/hafta/ay/...)
+# verisinden hesaplanan Denge/Ortalama/Direnç/Destek seviyeleri, o dönemin
+# kendisi için değil, BİR SONRAKİ (şu an içinde bulunulan / gelecek) dönem
+# için geçerlidir. Örn: Temmuz'un günlük mumlarından hesaplanan Aylık
+# seviyeler, Ağustos ayı boyunca kullanılacak seviyelerdir.
+# Bu yüzden ekranda gösterilen tarih aralığı, verinin geldiği dönem değil,
+# seviyelerin GEÇERLİ OLDUĞU (hedef) dönem olmalıdır.
+
+def get_current_day_range(today: date):
+    return today, today
+
+
+def get_current_week_range(today: date, is_crypto: bool = False):
+    weekday = today.weekday()
+    if is_crypto:
+        monday = today - timedelta(days=weekday)
+        sunday = monday + timedelta(days=6)
+        return monday, sunday
+
+    if weekday >= 5:
+        # Hafta sonu: piyasa kapalı, hedef BİR SONRAKİ hafta (Pzt-Cum).
+        next_monday = today - timedelta(days=weekday) + timedelta(days=7)
+        next_friday = next_monday + timedelta(days=4)
+        return next_monday, next_friday
+
+    this_monday = today - timedelta(days=weekday)
+    this_friday = this_monday + timedelta(days=4)
+    return this_monday, this_friday
+
+
+def _next_trading_day(today: date, is_crypto: bool = False) -> date:
+    """Kripto için her gün işlem günüdür. Diğerlerinde hafta sonuysa
+    bir sonraki Pazartesi'ye kaydırılır (Günlük/4 Saatlik hedef tarihi için)."""
+    if is_crypto:
+        return today
+    d = today
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def get_current_month_range(today: date):
+    first_of_month = today.replace(day=1)
+    if today.month == 12:
+        next_month_first = date(today.year + 1, 1, 1)
+    else:
+        next_month_first = date(today.year, today.month + 1, 1)
+    last_of_month = next_month_first - timedelta(days=1)
+    return first_of_month, last_of_month
+
+
+def get_current_half_year_range(today: date):
+    year = today.year
+    if today.month <= 6:
+        return date(year, 1, 1), date(year, 6, 30)
+    return date(year, 7, 1), date(year, 12, 31)
+
+
+def get_current_year_range(today: date):
+    return date(today.year, 1, 1), date(today.year, 12, 31)
+
+
+# ----------------------------------------------------------------------------
+# HESAPLAMA
+# ----------------------------------------------------------------------------
+
+def _parse_bar_date(bar: dict) -> date:
+    return datetime.strptime(bar["datetime"][:10], "%Y-%m-%d").date()
+
+
+def _parse_bar_datetime(bar: dict) -> datetime:
+    raw = bar["datetime"]
+    if len(raw) > 10:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    return datetime.strptime(raw, "%Y-%m-%d")
+
+
+def _filter_by_range(bars, start: date, end: date):
+    return [b for b in bars if start <= _parse_bar_date(b) <= end]
+
+
+def _bar_close(bar: dict) -> float:
+    """Bar içinde 'close' varsa onu, yoksa high/low ortalamasını döndürür."""
+    close_val = bar.get("close")
+    if close_val is not None:
         try:
-            toplam_hisse = ticker.fast_info.get('shares')
-        except Exception:
-            toplam_hisse = None
-    if not toplam_hisse or toplam_hisse <= 0:
-        return {"hata": f"{hisse_kodu} için hisse adedi (sharesOutstanding) bulunamadı."}
-
-    def temizle(deger):
-        try:
-            return float(str(deger).replace(',', '.').strip())
-        except:
-            return 0.0
-
-    ozsermaye = temizle(ozsermaye_temp)
-    donen_varliklar = temizle(donen_varliklar_temp)
-    duran_varliklar = temizle(duran_varliklar_temp)
-    kisa_borc = temizle(kisa_borc_temp)
-    stoklar = temizle(stoklar_temp)
-    ticari_alacaklar = temizle(ticari_alacaklar_temp)
-    toplam_varliklar_gercek = temizle(toplam_varliklar_gercek_temp)
-    uzun_vadeli_borc = temizle(uzun_vadeli_borc_temp)
-
-    # --- GERÇEK TTM (SON 4 ÇEYREK) HESAPLAMASI ---
-    # Formül: TTM = Bu yılki kümülatif + Geçen yılın tamamı(12 ay) - Geçen yılın aynı dönemi
-    # Bu, son 4 gerçek çeyreği otomatik olarak toplar, mevsimselliği dikkate alır.
-    try:
-        yil_str, ay_str = str(latest_col).split("/")
-        yil = int(yil_str)
-        ay_sayisi = int(ay_str)
-    except Exception:
-        yil = None
-        ay_sayisi = 12
-
-    def item_deger(kod, kolon):
-        if kolon is None:
-            return None
-        gercek_kolon = kolon if kolon in df.columns else _kolon_bul(kolon, df.columns)
-        if gercek_kolon is None:
-            return None
-        seri = df[df['FINANCIAL_ITEM_CODE'] == kod]
-        if seri.empty:
-            return None
-        try:
-            return temizle(seri[gercek_kolon].values[0])
-        except Exception:
-            return None
-
-    def ttm_hesapla(kod):
-        guncel = item_deger(kod, latest_col)
-        if guncel is None:
-            print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): latest_col ({latest_col}) için değer bulunamadı")
-            return 0.0, False
-        if ay_sayisi == 12 or yil is None:
-            return guncel, True  # zaten yıllık veri
-
-        # 1. Deneme: isme göre ara ("2025/12", "2025/3" gibi)
-        onceki_tam_yil_kolon = f"{yil - 1}/12"
-        ayni_donem_gecen_yil_kolon = f"{yil - 1}/{ay_sayisi}"
-        onceki_tam = item_deger(kod, onceki_tam_yil_kolon)
-        ayni_donem = item_deger(kod, ayni_donem_gecen_yil_kolon)
-        print(f"🔎 [{hisse_kodu}] ttm_hesapla({kod}) 1.deneme: guncel={guncel}, onceki_tam({onceki_tam_yil_kolon})={onceki_tam}, ayni_donem({ayni_donem_gecen_yil_kolon})={ayni_donem}")
-        if onceki_tam is not None and ayni_donem is not None:
-            print(f"🟢 [{hisse_kodu}] ttm_hesapla({kod}): GERÇEK TTM hesaplandı (isim eşleşmesi) = {guncel + onceki_tam - ayni_donem}")
-            return guncel + onceki_tam - ayni_donem, True  # gerçek TTM
-
-        # 2. Deneme: isim eşleşmesi başarısız olursa, POZİSYONA
-        # göre ara. donem_sutunlari kronolojik sırayla tüm dönem
-        # sütunlarını içeriyor (örn. [...,"2025/3","2025/6","2025/9",
-        # "2025/12","2026/3"]). Şirket her yıl 4 çeyrek raporluyorsa:
-        # - "bir önceki tam yıl" = latest_col'dan 1 önceki sütun
-        # - "geçen yılın aynı dönemi" = latest_col'dan 4 önceki sütun
-        try:
-            latest_index = donem_sutunlari.index(latest_col)
-            onceki_tam_idx = latest_index - 1
-            ayni_donem_idx = latest_index - 4
-            if onceki_tam_idx >= 0 and ayni_donem_idx >= 0:
-                onceki_tam_kolon_poz = donem_sutunlari[onceki_tam_idx]
-                ayni_donem_kolon_poz = donem_sutunlari[ayni_donem_idx]
-                # Doğrulama: "bir önceki tam yıl" gerçekten ".../12" ile bitiyor mu?
-                if str(onceki_tam_kolon_poz).endswith("/12"):
-                    onceki_tam_poz = item_deger(kod, onceki_tam_kolon_poz)
-                    ayni_donem_poz = item_deger(kod, ayni_donem_kolon_poz)
-                    if onceki_tam_poz is not None and ayni_donem_poz is not None:
-                        print(f"🟢 [{hisse_kodu}] ttm_hesapla({kod}): GERÇEK TTM hesaplandı (pozisyon eşleşmesi)")
-                        return guncel + onceki_tam_poz - ayni_donem_poz, True
-        except (ValueError, IndexError) as e:
-            print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): pozisyon denemesi hata: {e}")
-
-        # 3. Son çare: geçmiş yıl verisi hiçbir şekilde bulunamadı
-        # (örn. yeni halka arz), kaba yıllıklandırmaya düş
-        print(f"🔴 [{hisse_kodu}] ttm_hesapla({kod}): HER İKİ DENEME DE BAŞARISIZ, kaba ×{12/ay_sayisi if ay_sayisi else 1:.2f} kullanılıyor")
-        carpan = 12 / ay_sayisi if ay_sayisi else 1
-        return guncel * carpan, False
-
-    net_kar, net_kar_ttm_gercek = ttm_hesapla('3L')
-    favok, favok_ttm_gercek = ttm_hesapla('6A')
-    # --- Hasılat ve Satışların Maliyeti de TTM olarak hesaplanıyor ---
-    hasilat, hasilat_ttm_gercek = ttm_hesapla('3C')
-    satislarin_maliyeti_ham, cogs_ttm_gercek = ttm_hesapla('3CA')
-    satislarin_maliyeti = abs(satislarin_maliyeti_ham)  # "(-)" işaretli kalem, mutlak değer alınıyor
-    # --- DÜZELTME: Rapor notu artık SADECE net kârın gerçek TTM olup
-    # olmadığına bakıyor. Eskiden FAVÖK de başarısız olursa (örn. THYAO
-    # gibi FAVÖK kalemi olmayan/farklı yapıdaki şirketlerde) not yanlışlıkla
-    # "kaba tahmin" diyordu — net kâr gerçekten doğru hesaplanmış olsa bile.
-    # HBK/Graham/Peter Lynch zaten sadece net kâra dayandığı için, notun da
-    # net kârın durumunu yansıtması daha doğru.
-    ttm_gercek = net_kar_ttm_gercek
-    yillik_carpan = 12 / ay_sayisi if ay_sayisi and ay_sayisi < 12 else 1
-
-    # --- Future F/K formülü için gerçek 6 aylık (H1) net kâr ---
-    # Doğru formül: Future F/K = PD / (6 aylık net kâr × 2)
-    net_kar_6ay = None
-    if yil is not None:
-        h1_kolon = f"{yil}/6"
-        h1_deger = item_deger('3L', h1_kolon)
-        if h1_deger is not None and h1_deger > 0:
-            net_kar_6ay = h1_deger
-        elif ay_sayisi == 6:
-            # Zaten 6 aylık dönemdeysek mevcut kümülatif değer budur
-            net_kar_6ay = item_deger('3L', latest_col)
-
-    sonuc = {
-        'fiyat': round(guncel_fiyat, 2),
-        'hbdd': ozsermaye / toplam_hisse if toplam_hisse > 0 else 0,
-        'hbk': net_kar / toplam_hisse if toplam_hisse > 0 else 0,
-        'ozsermaye': ozsermaye,
-        'toplam_varliklar': toplam_varliklar_gercek if toplam_varliklar_gercek > 0 else (donen_varliklar + duran_varliklar),
-        'donen_varliklar': donen_varliklar,
-        'duran_varliklar': duran_varliklar,
-        'kisa_borc': kisa_borc,
-        'uzun_vadeli_borc': uzun_vadeli_borc,
-        'stoklar': stoklar,
-        'ticari_alacaklar': ticari_alacaklar,
-        'hasilat': hasilat,
-        'satislarin_maliyeti': satislarin_maliyeti,
-        'net_kar': net_kar,
-        'favok': favok,
-        'toplam_hisse': toplam_hisse,
-        'donem': latest_col,
-        'temettu_hisse_basi': temettu_hisse_basi,
-        'ay_sayisi': ay_sayisi,
-        'yillik_carpan': yillik_carpan,
-        'ttm_gercek': ttm_gercek,  # gerçek TTM mi, kaba tahmin mi
-        'net_kar_6ay': net_kar_6ay,
-        'piyasa': 'BIST',
-        'para_birimi': 'TL',
-    }
-
-    # --- DÜZELTME: ÖNBELLEĞE YAZMA EKLENDİ ---
-    # Eskiden _GUNLUK_ONBELLEK sadece OKUNUYOR, hiçbir yerde YAZILMIYORDU
-    # (bkz. yukarıdaki 223. satır) — bu yüzden önbellek fiilen hiç devreye
-    # girmiyor, her çağrı isyatirim'e yeniden gidiyor ve o anki sunucu
-    # yanıt kalitesine göre (gerçek TTM / eksik veri / kaba yıllıklandırma)
-    # FARKLI sonuçlar üretebiliyordu. Sadece GERÇEK TTM ile başarılı olan
-    # sonuçlar önbelleğe yazılıyor; kaba tahminle bitenler yazılmıyor ki
-    # bir sonraki sorguda isyatirim toparlanırsa gerçek veriyi yakalama
-    # şansı kalsın.
-    if ttm_gercek:
-        _onbellek_yaz(onbellek_anahtar, sonuc)
-
-    return sonuc
+            return float(close_val)
+        except (TypeError, ValueError):
+            pass
+    return (float(bar["high"]) + float(bar["low"])) / 2
 
 
-# --- 1b. ABD BORSASI VERİ ÇEKME (sadece yfinance ile) ---
-def get_us_data(hisse_kodu):
-    """
-    ABD hisseleri için yfinance zaten TTM (son 12 ay) EPS ve defter değerini
-    hazır verdiğinden BIST'teki gibi kümülatif dönem/yıllıklandırma
-    sorununa gerek yok.
-    """
-    ticker = yf.Ticker(hisse_kodu)
-    info = ticker.info
+def _aggregate_daily_to_weekly(daily_bars):
+    """Günlük barları hafta bazında (Pazartesi başlangıçlı) toplayıp haftalık
+    OHLC (high/low/close) üretir. datetime olarak o haftanın en güncel (son)
+    günü kullanılır. MetalpriceAPI gibi ayrı bir haftalık endpoint'i olmayan
+    kaynaklar için kullanılır (sadece 1 günlük istekle hem günlük hem haftalık
+    ihtiyacı karşılamak, API kotasını korumak için)."""
+    weeks = {}
+    for bar in sorted(daily_bars, key=lambda b: b["datetime"]):
+        d = datetime.strptime(bar["datetime"][:10], "%Y-%m-%d").date()
+        monday = d - timedelta(days=d.weekday())
+        key = monday.isoformat()
+        h = float(bar["high"])
+        l = float(bar["low"])
+        c = float(bar.get("close", h))
+        if key not in weeks:
+            weeks[key] = {"high": h, "low": l, "close": c, "last_date": d}
+        else:
+            w = weeks[key]
+            w["high"] = max(w["high"], h)
+            w["low"] = min(w["low"], l)
+            if d >= w["last_date"]:
+                w["close"] = c
+                w["last_date"] = d
+    result = []
+    for key in sorted(weeks.keys()):
+        w = weeks[key]
+        result.append({
+            "datetime": w["last_date"].isoformat(),
+            "high": w["high"],
+            "low": w["low"],
+            "close": w["close"],
+        })
+    return result
 
-    guncel_fiyat = info.get('currentPrice') or info.get('regularMarketPrice')
-    if guncel_fiyat is None:
-        hist = ticker.history(period="1d")
-        if hist.empty:
-            return None
-        guncel_fiyat = hist['Close'].iloc[-1]
 
-    eps = info.get('trailingEps')          # zaten TTM
-    bvps = info.get('bookValue')           # zaten hisse başına
-    toplam_hisse = info.get('sharesOutstanding')
-    favok = info.get('ebitda')
-    temettu_hisse_basi = info.get('dividendRate')
+CRYPTO_BASES = {
+    "BTC", "ETH", "XRP", "LTC", "BCH", "ADA", "SOL", "DOGE", "DOT", "MATIC",
+    "BNB", "AVAX", "LINK", "TRX", "SHIB", "ATOM", "UNI", "XLM", "ETC", "FIL",
+    "APT", "ARB", "OP", "NEAR", "ICP", "AAVE", "SAND", "MANA", "ALGO", "VET",
+}
 
-    if not toplam_hisse or toplam_hisse <= 0:
-        return {"hata": f"{hisse_kodu} için hisse adedi bulunamadı."}
-    if eps is None and bvps is None:
-        return None  # muhtemelen geçerli bir ABD hissesi değil
 
-    net_kar = (eps * toplam_hisse) if eps else 0
-    ozsermaye = (bvps * toplam_hisse) if bvps else 0
+def _is_crypto_symbol(user_symbol: str) -> bool:
+    normalized = normalize_symbol(user_symbol)
+    base = normalized.split("/")[0].upper()
+    return base in CRYPTO_BASES
 
-    # Cari oran / kaldıraç için bilanço verisini dene (opsiyonel, yoksa 0 kalır)
-    kisa_borc = 0.0
-    toplam_varliklar = 0.0
-    try:
-        bs = ticker.balance_sheet
-        if bs is not None and not bs.empty:
-            for row_name in ["Total Current Liabilities", "Current Liabilities"]:
-                if row_name in bs.index:
-                    kisa_borc = float(bs.loc[row_name].iloc[0])
-                    break
-            for row_name in ["Total Assets"]:
-                if row_name in bs.index:
-                    toplam_varliklar = float(bs.loc[row_name].iloc[0])
-                    break
-    except Exception:
-        pass
+
+def _filter_weekend_bars_if_not_crypto(bars, user_symbol: str):
+    if _is_crypto_symbol(user_symbol):
+        return bars
+    return [b for b in bars if _parse_bar_date(b).weekday() < 5]
+
+
+def _last_completed_day_bars(bars, today: date):
+    completed = [b for b in bars if _parse_bar_date(b) < today]
+    if not completed:
+        return []
+    latest = max(_parse_bar_date(b) for b in completed)
+    return [b for b in completed if _parse_bar_date(b) == latest]
+
+
+def _levels_from_bars(bars, birim: str = "gün") -> dict:
+    if not bars:
+        raise ValueError("bu dönem henüz tamamlanmamış veya veri yok")
+
+    # AYKIRI DEĞER (BAD TICK) KORUMASI: bazı yedek kaynaklar (özellikle
+    # yfinance üzerinden çekilen vadeli işlem verisi - kontrat geçişleri,
+    # ara sıra bozuk tick'ler vb.) gerçekçi olmayan şekilde sıçramış tekil
+    # barlar döndürebiliyor. Tek bir böyle bar bile range/median hesabını
+    # (dolayısıyla Direnç/Destek seviyelerini) komple anlamsız hale
+    # getirebiliyor.
+    #
+    # Sabit bir çarpan (ör. "medyanın 2 katından fazlası atılsın") yeterince
+    # sağlam değil: gerçek bir bad tick tam sınırın hemen üstünde/altında
+    # kalıp yakalanmayabiliyor. Bunun yerine MAD (Medyan Mutlak Sapma)
+    # tabanlı, verinin KENDİ doğal oynaklığına göre uyarlanan bir eşik
+    # kullanılıyor: normal dağılımla tutarlı olacak şekilde ölçeklenmiş
+    # MAD'in 6 katından daha fazla sapan barlar atılıyor. Bu eşik,
+    # gerçek trend/oynaklık dönemlerini (ör. fiyatın kademeli %40 artması)
+    # yanlışlıkla elemeyecek kadar geniş, ama tek seferlik aşırı sıçramaları
+    # (ör. gerçek fiyatın ~2 katı bir bad tick) yakalayacak kadar sıkı.
+    # En az 5 bar varsa uygulanır (az sayıda veriyle MAD güvenilir olmaz);
+    # filtre barların yarısından fazlasını elerse (veri gerçekten aşırı
+    # oynaksa) orijinal listeye geri dönülür.
+    if len(bars) >= 5:
+        closes_for_filter = [_bar_close(b) for b in bars]
+        median_close_for_filter = statistics.median(closes_for_filter)
+        abs_devs = [abs(c - median_close_for_filter) for c in closes_for_filter]
+        mad = statistics.median(abs_devs)
+        if mad > 0:
+            scaled_mad = mad * 1.4826  # normal dağılıma göre ölçeklenmiş MAD
+            threshold = 6 * scaled_mad
+
+            def _is_plausible(bar) -> bool:
+                try:
+                    c = _bar_close(bar)
+                except Exception:
+                    return True
+                return abs(c - median_close_for_filter) <= threshold
+
+            filtered_bars = [b for b in bars if _is_plausible(b)]
+            if filtered_bars and len(filtered_bars) >= max(3, len(bars) // 2):
+                bars = filtered_bars
+
+    values = []
+    for bar in bars:
+        h = round(float(bar["high"]), 4)
+        l = round(float(bar["low"]), 4)
+        values.append(h)
+        # high == low ise (ör. BIST endekslerinde gerçek yüksek/düşük veri
+        # olmadığı için ikisi de kapanışa eşitleniyor), aynı değeri iki kez
+        # eklemek o barı yapay olarak "tekrarlayan seviye" (mod) yapar.
+        # Bu yüzden eşitse sadece bir kez sayıyoruz.
+        if l != h:
+            values.append(l)
+
+    denge = statistics.median(values)
+    ortalama = statistics.mean(values)
+    range_ = max(values) - min(values)
+    half_range = range_ * 0.5
+
+    counts = Counter(values)
+    mods = sorted([v for v, c in counts.items() if c >= 2])
+    dates = sorted({_parse_bar_date(b) for b in bars})
+
+    destek1 = denge - half_range
+    destek2 = denge - range_
+
+    uyari = None
+    if destek2 < 0:
+        uyari = "⚠️ Bu dönem çok oynak; Destek 2 matematiksel olarak negatif çıktı (fiyatta gerçekleşemez)."
+    elif destek1 < 0:
+        uyari = "⚠️ Bu dönem çok oynak; Destek 1 matematiksel olarak negatif çıktı (fiyatta gerçekleşemez)."
 
     return {
-        'fiyat': round(guncel_fiyat, 2),
-        'hbdd': bvps if bvps else 0,
-        'hbk': eps if eps else 0,
-        'ozsermaye': ozsermaye,
-        'toplam_varliklar': toplam_varliklar,
-        'kisa_borc': kisa_borc,
-        'net_kar': net_kar,
-        'favok': favok if favok else 0,
-        'toplam_hisse': toplam_hisse,
-        'donem': "TTM (Son 12 Ay)",
-        'temettu_hisse_basi': temettu_hisse_basi,
-        'ay_sayisi': 12,
-        'yillik_carpan': 1,
-        'piyasa': 'ABD',
-        'para_birimi': 'USD',
+        "denge": denge,
+        "ortalama": ortalama,
+        "direnc1": denge + half_range,
+        "direnc2": denge + range_,
+        "destek1": destek1,
+        "destek2": destek2,
+        "range": range_,
+        "mod": mods,
+        "adet": len(bars),
+        "birim": birim,
+        "baslangic": dates[0].isoformat(),
+        "bitis": dates[-1].isoformat(),
+        "uyari": uyari,
     }
 
 
-# --- 1c. EVRENSEL VERİ ÇEKME: önce BIST, olmazsa ABD dener ---
-def get_company_data(hisse_kodu):
-    # --- DEĞİŞİKLİK: ABD borsası desteği devre dışı bırakıldı ---
-    # Sebep: Her /hesapla komutunda önce BIST denenip başarısız olunca
-    # ABD'yi denemek, BIST hisselerinde bile gereksiz gecikmeye (yavaşlığa)
-    # yol açıyordu. Odağı BIST'e geri veriyoruz.
+def _compute_short_daily_outputsize(today: date) -> int:
+    month_start, _ = get_last_completed_month_range(today)
+    days_needed = (today - month_start).days + 7
+    return max(15, min(days_needed, MAX_SHORT_DAILY_BARS))
+
+
+def _compute_long_weekly_outputsize(today: date) -> int:
+    year_start, _ = get_last_completed_year_range(today)
+    days_needed = (today - year_start).days
+    weeks_needed = (days_needed // 7) + 3
+    return max(30, min(weeks_needed, MAX_LONG_WEEKLY_BARS))
+
+
+def calculate_all_periods(user_symbol: str) -> dict:
+    today = datetime.now(TR_TZ).date()
+    is_crypto = _is_crypto_symbol(user_symbol)
+    hedef_gun = _next_trading_day(today, is_crypto)
+    results = {}
+
+    # Güncel fiyat: en taze veriden (önce 4 saatlik, olmazsa günlük) yakalanır.
+    guncel_fiyat = None
+    guncel_fiyat_zaman = None
+
+    # --- 4 Saatlik ---
     try:
-        veri = get_bist_data(hisse_kodu)
-        if veri is not None and "hata" not in veri:
-            return veri
-        bist_hata = veri.get("hata") if veri else "Veri bulunamadı."
+        four_hour_bars_raw = fetch_bars(user_symbol, "4h", FOUR_HOUR_OUTPUTSIZE)
+        four_hour_bars = _filter_weekend_bars_if_not_crypto(four_hour_bars_raw, user_symbol)
+        last_bar = max(four_hour_bars, key=_parse_bar_datetime) if four_hour_bars else None
+        if last_bar is None:
+            raise ValueError("Yeterli 4 saatlik veri bulunamadı.")
+        results["4 Saatlik"] = _levels_from_bars([last_bar], birim="adet 4 saatlik mum")
+        # Bu seviyeler son kapanan 4 saatlik mumdan hesaplanır ama BİR SONRAKİ
+        # 4 saatlik mum için geçerlidir; tarih etiketi bugünü gösterir.
+        results["4 Saatlik"]["baslangic"] = hedef_gun.isoformat()
+        results["4 Saatlik"]["bitis"] = hedef_gun.isoformat()
+        guncel_fiyat = _bar_close(last_bar)
+        guncel_fiyat_zaman = _parse_bar_datetime(last_bar)
     except Exception as e:
-        bist_hata = str(e)
+        results["4 Saatlik"] = {"hata": str(e)}
 
-    return {"hata": bist_hata}
+    # --- Günlük, Haftalık, Aylık (günlük mumlar) ---
+    try:
+        short_size = _compute_short_daily_outputsize(today)
+        daily_bars = fetch_bars(user_symbol, "1day", short_size)
+        daily_bars = _filter_weekend_bars_if_not_crypto(daily_bars, user_symbol)
+    except Exception as e:
+        error = {"hata": str(e)}
+        results["Günlük"] = error
+        results["Haftalık"] = error
+        results["Aylık"] = error
+        daily_bars = None
+
+    if daily_bars is not None:
+        if guncel_fiyat is None:
+            latest_daily_bar = max(daily_bars, key=_parse_bar_date) if daily_bars else None
+            if latest_daily_bar is not None:
+                guncel_fiyat = _bar_close(latest_daily_bar)
+                guncel_fiyat_zaman = _parse_bar_datetime(latest_daily_bar)
+
+        try:
+            bars = _last_completed_day_bars(daily_bars, today)
+            results["Günlük"] = _levels_from_bars(bars, birim="gün")
+            # Son kapanan günden hesaplanır, BUGÜN için geçerlidir.
+            results["Günlük"]["baslangic"] = hedef_gun.isoformat()
+            results["Günlük"]["bitis"] = hedef_gun.isoformat()
+        except Exception as e:
+            results["Günlük"] = {"hata": str(e)}
+
+        try:
+            start, end = get_last_completed_week_range(today, is_crypto=is_crypto)
+            results["Haftalık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
+            hedef_start, hedef_end = get_current_week_range(today, is_crypto=is_crypto)
+            results["Haftalık"]["baslangic"] = hedef_start.isoformat()
+            results["Haftalık"]["bitis"] = hedef_end.isoformat()
+        except Exception as e:
+            results["Haftalık"] = {"hata": str(e)}
+
+        try:
+            start, end = get_last_completed_month_range(today)
+            results["Aylık"] = _levels_from_bars(_filter_by_range(daily_bars, start, end), birim="gün")
+            hedef_start, hedef_end = get_current_month_range(today)
+            results["Aylık"]["baslangic"] = hedef_start.isoformat()
+            results["Aylık"]["bitis"] = hedef_end.isoformat()
+        except Exception as e:
+            results["Aylık"] = {"hata": str(e)}
+
+    # --- 6 Aylık, Yıllık (haftalık mumlar) ---
+    try:
+        long_size = _compute_long_weekly_outputsize(today)
+        weekly_bars = fetch_bars(user_symbol, "1week", long_size)
+    except Exception as e:
+        error = {"hata": str(e)}
+        results["6 Aylık"] = error
+        results["Yıllık"] = error
+        weekly_bars = None
+
+    if weekly_bars is not None:
+        try:
+            start, end = get_last_completed_half_year_range(today)
+            results["6 Aylık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
+            hedef_start, hedef_end = get_current_half_year_range(today)
+            results["6 Aylık"]["baslangic"] = hedef_start.isoformat()
+            results["6 Aylık"]["bitis"] = hedef_end.isoformat()
+        except Exception as e:
+            results["6 Aylık"] = {"hata": str(e)}
+
+        try:
+            start, end = get_last_completed_year_range(today)
+            results["Yıllık"] = _levels_from_bars(_filter_by_range(weekly_bars, start, end), birim="hafta")
+            hedef_start, hedef_end = get_current_year_range(today)
+            results["Yıllık"]["baslangic"] = hedef_start.isoformat()
+            results["Yıllık"]["bitis"] = hedef_end.isoformat()
+        except Exception as e:
+            results["Yıllık"] = {"hata": str(e)}
+
+    results["_guncel_fiyat"] = guncel_fiyat
+    results["_guncel_fiyat_zaman"] = guncel_fiyat_zaman
+    return results
 
 
-def basit_dcf_deger(net_kar, toplam_hisse, buyume=DCF_BUYUME_ORANI,
-                     iskonto=DCF_ISKONTO_ORANI, terminal_buyume=DCF_TERMINAL_BUYUME,
-                     yil=DCF_YIL_SAYISI):
-    if not net_kar or net_kar <= 0 or not toplam_hisse or toplam_hisse <= 0:
+# ----------------------------------------------------------------------------
+# TELEGRAM BOTU
+# ----------------------------------------------------------------------------
+
+PERIOD_ICONS = {
+    "4 Saatlik": "🕓",
+    "Günlük": "🕐",
+    "Haftalık": "📅",
+    "Aylık": "🗓️",
+    "6 Aylık": "📈",
+    "Yıllık": "🏆",
+}
+
+CONFIRMATION_NOTES = {
+    "4 Saatlik": "2 adet 30 dakikalık kapanış",
+    "Günlük": "2 adet 1 saatlik kapanış",
+    "Haftalık": "2 adet 4 saatlik kapanış",
+    "Aylık": "2 adet günlük kapanış",
+    "6 Aylık": "2 adet aylık kapanış",
+    "Yıllık": "2 adet 6 aylık kapanış",
+}
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✨ <b>Denge Aralığı Botu</b> ✨\n\n"
+        "Bana bir enstrüman kodu gönder (örn: <b>BTCUSD</b>, <b>XAUUSD</b>, <b>XAGUSD</b>, <b>XPTUSD</b>, "
+        "<b>XPDUSD</b>, <b>EURUSD</b>, <b>DXY</b>, <b>VIX</b>, <b>XU100</b>, <b>XU030</b>, <b>XU500</b>, <b>XAUTRYG</b>).\n\n"
+        "🕐 Günlük  📅 Haftalık  🗓️ Aylık  📈 6 Aylık  🏆 Yıllık\n"
+        "için Denge (Medyan), Aritmetik Ortalama, Direnç 1/2 ve Destek 1/2 "
+        "seviyelerini hesaplayayım.\n\n"
+        "<i>Yalnızca TAMAMLANMIŞ (kapanmış) son periyot kullanılır.</i>\n"
+        "<i>6 Aylık ve Yıllık, API kredi limiti nedeniyle haftalık mumlarla hesaplanır.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def _format_tr_date(iso_date: str) -> str:
+    d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    return d.strftime("%d.%m.%Y")
+
+
+def format_period_block(period_name: str, result: dict) -> str:
+    icon = PERIOD_ICONS.get(period_name, "•")
+
+    if "hata" in result:
+        hata_escaped = html.escape(str(result["hata"]))
+        return f"{icon} <b>{html.escape(period_name)}</b>\n⚠️ <i>{hata_escaped}</i>"
+
+    birim_etiketi = html.escape(f"{result['adet']} {result['birim']} verisiyle hesaplandı")
+    tarih_araligi = html.escape(f"{_format_tr_date(result['baslangic'])} → {_format_tr_date(result['bitis'])}")
+
+    def row(label: str, value: float, emoji: str = "") -> str:
+        full_label = f"{emoji} {label}" if emoji else label
+        return f"{full_label:<11}{value:>11,.2f}"
+
+    table = "\n".join([
+        row("Direnç 2", result["direnc2"], "🔴"),
+        row("Direnç 1", result["direnc1"], "🔴"),
+        "─" * 22,
+        row("Denge", result["denge"], "🟣"),
+        row("Ortalama", result["ortalama"], "🟢"),
+        "─" * 22,
+        row("Destek 1", result["destek1"], "🔵"),
+        row("Destek 2", result["destek2"], "🔵"),
+    ])
+
+    lines = [
+        f"{icon} <b>{html.escape(period_name)}</b>",
+        f"<i>{birim_etiketi}</i>",
+        f"<i>📆 Geçerlilik: {tarih_araligi}</i>",
+        f"<pre><code>{html.escape(table)}</code></pre>",
+    ]
+
+    if result["mod"]:
+        mod_str = ", ".join(f"{v:,.2f}" for v in result["mod"])
+        lines.append(f"🔁 <i>Mod (tekrarlayan seviye): {mod_str}</i>")
+
+    if result.get("uyari"):
+        lines.append(f"<i>{html.escape(result['uyari'])}</i>")
+
+    confirmation_note = CONFIRMATION_NOTES.get(period_name)
+    if confirmation_note:
+        lines.append(f"📌 <i>Onay: {html.escape(confirmation_note)}, Denge'nin üstünde ya da altında kapanmalı</i>")
+
+    return "\n".join(lines)
+
+
+def _format_current_price_line(guncel_fiyat, guncel_fiyat_zaman):
+    if guncel_fiyat is None:
         return None
-    if iskonto <= terminal_buyume:
-        return None
-
-    pv_toplam = 0.0
-    nakit_akisi = net_kar
-    for yil_no in range(1, yil + 1):
-        nakit_akisi = nakit_akisi * (1 + buyume)
-        pv_toplam += nakit_akisi / ((1 + iskonto) ** yil_no)
-
-    terminal_deger = nakit_akisi * (1 + terminal_buyume) / (iskonto - terminal_buyume)
-    pv_terminal = terminal_deger / ((1 + iskonto) ** yil)
-
-    toplam_deger = pv_toplam + pv_terminal
-    return toplam_deger / toplam_hisse
-
-
-def gordon_deger(temettu_hisse_basi, buyume=GORDON_BUYUME_ORANI, iskonto=GORDON_ISKONTO_ORANI):
-    if not temettu_hisse_basi or temettu_hisse_basi <= 0:
-        return None
-    if iskonto <= buyume:
-        return None
-    d1 = temettu_hisse_basi * (1 + buyume)
-    return d1 / (iskonto - buyume)
-
-
-# --- 2. HESAPLAMA FONKSİYONU ---
-def hesapla_ve_rapor_ver(hisse_kodu):
-    veri = get_company_data(hisse_kodu)
-    if veri is None or "hata" in veri:
-        return f"❌ Veri çekilemedi: {veri.get('hata', 'Bilinmeyen hata')}"
-
-    f = veri['fiyat']
-    hbk = veri['hbk']
-    hbdd = veri['hbdd']
-    ozsermaye = veri['ozsermaye']
-    aktif = veri['toplam_varliklar']
-    donen_varliklar = veri.get('donen_varliklar', 0)
-    duran_varliklar = veri.get('duran_varliklar', 0)
-    kisa_borc = veri['kisa_borc']
-    uzun_vadeli_borc = veri.get('uzun_vadeli_borc', 0)
-    stoklar = veri.get('stoklar', 0)
-    ticari_alacaklar = veri.get('ticari_alacaklar', 0)
-    hasilat = veri.get('hasilat', 0)
-    satislarin_maliyeti = veri.get('satislarin_maliyeti', 0)
-    net_kar = veri['net_kar']
-    favok = veri['favok']
-    toplam_hisse = veri['toplam_hisse']
-    donem = veri['donem']
-    temettu_hisse_basi = veri.get('temettu_hisse_basi')
-    ay_sayisi = veri.get('ay_sayisi', 12)
-    yillik_carpan = veri.get('yillik_carpan', 1)
-    ttm_gercek = veri.get('ttm_gercek', True)
-    net_kar_6ay = veri.get('net_kar_6ay')
-    piyasa = veri.get('piyasa', 'BIST')
-    para_birimi = veri.get('para_birimi', 'TL')
-    sembol = "TL" if para_birimi == "TL" else "$"
-
-    is_banka = hisse_kodu in BANKALAR  # sadece BIST bankaları için anlamlı
-
-    fk = f / hbk if hbk > 0 else 0
-    pddd = f / hbdd if hbdd > 0 else 0
-    roe = net_kar / ozsermaye if ozsermaye > 0 else 0
-    cari_oran = aktif / kisa_borc if kisa_borc > 0 else 0
-
-    # --- Kaldıraç Oranı kaynağa göre doğru hesaplanıyor:
-    # (Kısa + Uzun Vadeli Toplam Borç) / Toplam Varlıklar
-    toplam_borc = kisa_borc + uzun_vadeli_borc
-    kaldiraç = toplam_borc / aktif if aktif > 0 else 0
-
-    # --- Asit-Test Oranı (Dönen Varlıklar - Stoklar) / Kısa Vadeli Borç ---
-    asit_test = (donen_varliklar - stoklar) / kisa_borc if kisa_borc > 0 else 0
-
-    # --- Duran Varlıkların Özsermayeye Oranı ---
-    duran_ozkaynak_orani = duran_varliklar / ozsermaye if ozsermaye > 0 else 0
-
-    # --- Alacak Devir Hızı = Hasılat / Ticari Alacaklar ---
-    alacak_devir_hizi = hasilat / ticari_alacaklar if ticari_alacaklar > 0 else 0
-
-    # --- Stok Devir Hızı = Satışların Maliyeti / Stoklar ---
-    # NOT: Doğrusu "ortalama stok" kullanmaktır (dönem başı+sonu / 2),
-    # şu an sadece dönem sonu stok kullanılıyor (yaklaşık değer).
-    stok_devir_hizi = satislarin_maliyeti / stoklar if stoklar > 0 else 0
-
-    # --- Net Kâr Marjı = Net Kâr / Hasılat ---
-    net_kar_marji = net_kar / hasilat if hasilat > 0 else 0
-
-    hedef_pddd = (f / pddd) * 1.3 if pddd > 0 else 0
-    graham = math.sqrt(22.5 * hbk * hbdd) if (hbk > 0 and hbdd > 0 and not is_banka) else 0
-    peter = hbk * 15 if hbk > 0 else 0
-    peg = fk / 15 if fk > 0 else 0
-
-    if not is_banka and favok > 0:
-        hedef_fd_favok = (f / ((f * toplam_hisse + kisa_borc) / favok)) * 10
-        net_borc_favok = kisa_borc / favok
-    else:
-        hedef_fd_favok = 0
-        net_borc_favok = 0
-
-    dcf_deger = basit_dcf_deger(net_kar, toplam_hisse) if not is_banka else None
-    gordon = gordon_deger(temettu_hisse_basi)
-
-    # --- DEĞİŞİKLİK: sektör/emsal karşılaştırması geçici olarak kapatıldı ---
-    # Sebep: Her hissede 4-8 emsal hisseyi ayrı ayrı çekmek (isyatirim + yfinance),
-    # tek bir /hesapla komutunu 5+ hissenin verisini çekmeye dönüştürüyordu,
-    # bu da ciddi yavaşlığa ve rate-limit riskine yol açıyordu. İleride
-    # basit bir zaman-bazlı cache (örn. 1 saatlik) ile geri getirilebilir.
-    sektor_bilgi = None
-    sektor_hedef_fk = None
-    if sektor_bilgi and sektor_bilgi.get('ort_fk') and hbk > 0:
-        sektor_hedef_fk = hbk * sektor_bilgi['ort_fk']
-
-    # --- Tarihsel/Future F/K artık keyfi sabitler yerine gerçek sektör
-    # (veya BIST100 hazır olduğunda) F/K'sını çarpan olarak kullanıyor.
-    # Sektör verisi yoksa bu deneysel değerler hesaplanamaz, "N/A" gösterilir.
-    carpan_fk = sektor_bilgi['ort_fk'] if sektor_bilgi and sektor_bilgi.get('ort_fk') else None
-
-    # Tarihsel F/K: gerçek 3 yıllık ortalama F/K verisi şu an çekilmiyor
-    # (geçmiş her dönem için ayrı fiyat verisi gerektirir), bu yüzden bu
-    # değer güvenilir değildir ve raporda ayrıca işaretlenir.
-    hedef_tarihsel_fk = None  # yeterli veri yok, gösterilmeyecek
-
-    # Future F/K: PD / (6 aylık net kâr × 2) — dokümandaki formül birebir
-    if net_kar_6ay and net_kar_6ay > 0 and carpan_fk:
-        piyasa_degeri = f * toplam_hisse
-        future_fk = piyasa_degeri / (net_kar_6ay * 2)
-        hedef_future_fk = (f / future_fk) * carpan_fk if future_fk > 0 else None
-    else:
-        hedef_future_fk = None
-
-    hedef_odennis_sermaye = (net_kar / toplam_hisse) * 10 if toplam_hisse > 0 else 0
-
-    ppd = (net_kar * 7) + (0.5 * ozsermaye)
-    hedef_ppd = ppd / toplam_hisse if toplam_hisse > 0 else 0
-
-    degerler = [hedef_pddd, graham, peter, hedef_fd_favok]
-    gecerli = [d for d in degerler if d > 0]
-    ic_sel_deger = sum(gecerli) / len(gecerli) if gecerli else 0
-
-    def tl(deger):
-        return format_para(deger, para_birimi)
-
-    rapor = f"{'🇹🇷' if piyasa == 'BIST' else '🇺🇸'} **{hisse_kodu} KAPSAMLI DEĞERLEME RAPORU** {'🇹🇷' if piyasa == 'BIST' else '🇺🇸'}\n"
-    rapor += f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
-    rapor += f"🌍 Piyasa: {piyasa}\n"
-    rapor += f"📅 Kullanılan Finansal Dönem: {donem}\n"
-    if yillik_carpan != 1:
-        if ttm_gercek:
-            rapor += (
-                f"🔄 *Not: Son 4 gerçek çeyreğin toplamı (TTM) kullanıldı — "
-                f"mevsimsellik dikkate alınmış oldu (kaba ×{yillik_carpan:.2f} "
-                f"yıllıklandırma değil).*\n"
-            )
+    zaman_str = ""
+    if guncel_fiyat_zaman is not None:
+        if guncel_fiyat_zaman.time() == guncel_fiyat_zaman.min.time():
+            zaman_str = guncel_fiyat_zaman.strftime("%d.%m.%Y")
         else:
-            rapor += (
-                f"🔄 *Not: {ay_sayisi} aylık kümülatif kâr/FAVÖK, geçmiş yıl "
-                f"verisi bulunamadığı için kaba ×{yillik_carpan:.2f} ile "
-                f"yıllıklandırıldı (basit doğrusal varsayım, mevsimsellik "
-                f"dikkate alınmadı).*\n"
-            )
-    rapor += f"---\n"
-    rapor += f"📈 **Güncel Fiyat:** {tl(f)} {sembol}\n"
-    rapor += f"💠 **HBK (Hisse Başı Kâr):** {tl(hbk)} {sembol}\n"
-    rapor += f"💠 **HBDD (Hisse Başı Defter Değeri):** {tl(hbdd)} {sembol}\n"
-    rapor += f"---\n\n"
+            zaman_str = guncel_fiyat_zaman.strftime("%d.%m.%Y %H:%M")
+    fiyat_str = f"{guncel_fiyat:,.2f}"
+    if zaman_str:
+        return f"💵 <b>Güncel Fiyat:</b> <code>{fiyat_str}</code>  <i>({zaman_str} itibarıyla)</i>"
+    return f"💵 <b>Güncel Fiyat:</b> <code>{fiyat_str}</code>"
 
-    rapor += f"**🔮 BİLANÇO BAZLI ADİL DEĞERLER:**\n"
-    rapor += f"🔹 Graham Değeri: {tl(graham)} {sembol}\n"
-    rapor += f"🔹 PD/DD Bazlı Hedef: {tl(hedef_pddd)} {sembol}\n"
-    if hedef_fd_favok > 0:
-        rapor += f"🔹 FD/FAVÖK Bazlı Hedef: {tl(hedef_fd_favok)} {sembol}\n"
+
+async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_symbol = update.message.text.strip()
+    processing_msg = await update.message.reply_text(f"⏳ {user_symbol.upper()} hesaplanıyor...")
+
+    results = calculate_all_periods(user_symbol)
+    guncel_fiyat_satiri = _format_current_price_line(
+        results.pop("_guncel_fiyat", None), results.pop("_guncel_fiyat_zaman", None)
+    )
+
+    separator = "━" * 24
+    header_blocks = [f"💰 <b>{html.escape(user_symbol.upper())}</b>"]
+    if guncel_fiyat_satiri:
+        header_blocks.append(guncel_fiyat_satiri)
+    header_blocks.append(separator)
+
+    blocks = header_blocks + [""]
+    for i, period_name in enumerate(PERIOD_NAMES):
+        blocks.append(format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"})))
+        if i < len(PERIOD_NAMES) - 1:
+            blocks.append("")
+
+    message = "\n".join(blocks).strip()
+
+    if len(message) <= 4000:
+        await processing_msg.edit_text(message, parse_mode=ParseMode.HTML)
     else:
-        rapor += f"🔹 FD/FAVÖK Bazlı Hedef: N/A _(bu şirket için FAVÖK verisi bulunamadı)_\n"
-    rapor += f"---\n\n"
-
-    rapor += f"**📈 BÜYÜME VE KÂRLILIK BAZLI ADİL DEĞERLER:**\n"
-    rapor += f"🔸 Peter Lynch Değeri: {tl(peter)} {sembol}\n"
-    rapor += f"🔸 PEG Rasyosu: {round(peg, 2)}\n"
-    if peg > 0:
-        if peg < 1:
-            rapor += f"   (1'in altında: Hisse büyümesine göre UCUZ görünüyor.)\n"
-        elif peg == 1:
-            rapor += f"   (1'e eşit: Hisse adil değerinde.)\n"
-        else:
-            rapor += f"   (1'in üzerinde: Hisse büyümesine göre PAHALI görünüyor.)\n"
-    else:
-        rapor += f"   (PEG hesaplanamıyor)\n"
-    rapor += f"🔸 ROE (Özsermaye Kârlılığı): %{round(roe * 100, 2)}\n"
-    rapor += f"---\n\n"
-
-    if ic_sel_deger > 0:
-        rapor += f"⭐ **GENEL ORTALAMA ADİL DEĞER:**\n**{tl(ic_sel_deger)} {sembol}**\n"
-        rapor += f"_(Graham, Peter Lynch, PD/DD ve FD/FAVÖK ortalaması)_\n\n"
-        fark = ((f - ic_sel_deger) / ic_sel_deger) * 100
-        if fark < -5:
-            rapor += f"📈 Hisse adil değerine göre %{round(abs(fark), 1)} İSKONTOLU (UCUZ) görünüyor.\n"
-        elif fark > 5:
-            rapor += f"📉 Hisse adil değerine göre %{round(fark, 1)} PRİMLİ (PAHALI) görünüyor.\n"
-        else:
-            rapor += f"⚖️ Hisse adil değerine göre tam değerinde görünüyor.\n"
-
-        if f > ic_sel_deger * 5 or f < ic_sel_deger / 5:
-            rapor += (
-                f"\n⚠️ **UYARI:** Piyasa fiyatı ile hesaplanan adil değer arasında "
-                f"olağandışı büyük bir fark var (5 kattan fazla). Sonuçlara "
-                f"temkinli yaklaşın, mümkünse ham verileri manuel kontrol edin.\n"
-            )
-
-        if pddd and pddd > 8:
-            rapor += (
-                f"\n⚠️ **UYARI:** Bu şirketin PD/DD oranı çok yüksek (şu an "
-                f"{round(pddd, 1)}x) — bu genelde hisse geri alımları "
-                f"(buyback) nedeniyle defter değeri çok düşük olan, "
-                f"\"varlık hafif\" (asset-light) şirketlerde görülür (Apple "
-                f"gibi ABD teknoloji devlerinde yaygın). Bu durumda Graham "
-                f"ve PD/DD Bazlı Hedef gibi varlık-temelli formüller "
-                f"anlamlı sonuç vermez, ortalamayı yapay şekilde aşağı "
-                f"çeker. Bu tür şirketlerde DCF veya büyüme çarpanlarına "
-                f"bakmak daha doğru olur.\n"
-            )
-    rapor += f"---\n\n"
-
-    rapor += f"**📌 DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
-    if sektor_bilgi:
-        rapor += (
-            f"🏭 Sektör: {sektor_bilgi['sektor']} "
-            f"({sektor_bilgi['emsal_sayisi']} emsal hisse ile karşılaştırıldı)\n"
-        )
-        if sektor_bilgi['sektor'] == "GYO":
-            rapor += (
-                "⚠️ *GYO şirketleri gelirini gayrimenkul yeniden değerleme "
-                "kazançlarından da elde eder, bu yüzden Graham/Peter Lynch "
-                "gibi kâr-bazlı kıyaslamalar bu sektörde daha az güvenilirdir.*\n"
-            )
-        if sektor_bilgi.get('ort_fk'):
-            rapor += f"🔻 Sektör Medyan F/K: {round(sektor_bilgi['ort_fk'], 2)}"
-            if sektor_hedef_fk:
-                rapor += f" → Sektöre Göre Hedef: {tl(sektor_hedef_fk)} {sembol}\n"
-            else:
-                rapor += "\n"
-        if sektor_bilgi.get('ort_pddd'):
-            rapor += f"🔻 Sektör Medyan PD/DD: {round(sektor_bilgi['ort_pddd'], 2)} (bu hissenin PD/DD'si: {round(pddd, 2) if pddd else 'N/A'})\n"
-    if dcf_deger is not None:
-        rapor += (
-            f"🔻 DCF Değeri (Basitleştirilmiş): {tl(dcf_deger)} {sembol} "
-            f"_(FCF yerine net kâr kullanıldı; büyüme=%{int(DCF_BUYUME_ORANI*100)}, "
-            f"iskonto=%{int(DCF_ISKONTO_ORANI*100)}, terminal=%{int(DCF_TERMINAL_BUYUME*100)}, "
-            f"{DCF_YIL_SAYISI} yıl)_\n"
-        )
-    elif is_banka:
-        rapor += f"🔻 DCF Değeri: Bankalar için uygun değil\n"
-    if gordon is not None:
-        rapor += (
-            f"🔻 Gordon Değeri (Temettü İskonto Modeli): {tl(gordon)} {sembol} "
-            f"_(temettü={tl(temettu_hisse_basi)} {sembol}, büyüme=%{int(GORDON_BUYUME_ORANI*100)}, "
-            f"iskonto=%{int(GORDON_ISKONTO_ORANI*100)})_\n"
-        )
-    else:
-        rapor += f"🔻 Gordon Değeri: Temettü verisi yok veya hesaplanamadı\n"
-    rapor += f"🔻 Tarihsel F/K Bazlı Hedef: N/A _(gerçek 3 yıllık geçmiş F/K verisi henüz çekilmiyor)_\n"
-    if hedef_future_fk is not None:
-        rapor += (
-            f"🔻 Future's F/K Bazlı Hedef: {tl(hedef_future_fk)} {sembol} "
-            f"_(6 aylık kâr × 2 ve sektör F/K'sına göre)_\n"
-        )
-    else:
-        rapor += f"🔻 Future's F/K Bazlı Hedef: N/A _(6 aylık veri veya sektör F/K'sı yok)_\n"
-    rapor += f"🔻 Ödenmiş Sermaye Bazlı Hedef: {tl(hedef_odennis_sermaye)} {sembol} (HBK x 10)\n"
-    rapor += f"🔻 PPD Bazlı Hedef: {tl(hedef_ppd)} {sembol} (Geleneksel ağırlık)\n"
-    rapor += f"---\n\n"
-
-    rapor += f"**🩺 FİNANSAL SAĞLIK:**\n"
-    rapor += f"📊 Cari Oran: {round(cari_oran, 2)} ({cari_oran_yorum(cari_oran)})\n"
-    if asit_test > 0:
-        rapor += f"📊 Asit-Test Oranı: {round(asit_test, 2)} _(ideal: 0,7-1,3)_\n"
-    rapor += f"📊 Kaldıraç Oranı: %{round(kaldiraç * 100, 1)} ({kaldirac_yorum(kaldiraç * 100)})\n"
-    if duran_ozkaynak_orani > 0:
-        rapor += f"📊 Duran Varlık/Özsermaye: {round(duran_ozkaynak_orani, 2)} _(ideal: ≤1)_\n"
-    if not is_banka and favok > 0:
-        rapor += f"📊 Net Borç / FAVÖK: {round(net_borc_favok, 2)}\n"
-    if alacak_devir_hizi > 0:
-        rapor += f"📊 Alacak Devir Hızı: {round(alacak_devir_hizi, 2)} _(ideal: >2)_\n"
-    if stok_devir_hizi > 0:
-        rapor += f"📊 Stok Devir Hızı: {round(stok_devir_hizi, 2)} _(ideal: >2, ortalama stok yerine dönem sonu kullanıldı)_\n"
-    if net_kar_marji != 0:
-        rapor += f"📊 Net Kâr Marjı: %{round(net_kar_marji * 100, 2)} _(ideal: >%8, sektöre göre değişir)_\n"
-    rapor += f"---\n\n"
-
-    if piyasa == 'ABD':
-        rapor += (
-            f"ℹ️ *ABD hissesi notu: Cari Oran/Kaldıraç için bilanço verisi "
-            f"her zaman tam gelmeyebilir, bu durumda 0 görünür. Ayrıca banka "
-            f"türü ABD şirketleri (JPM, BAC vb.) için de BIST'teki gibi "
-            f"özel bir format ayrımı henüz yapılmadı, dikkatli yorumlayın.*\n"
-        )
-
-    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n\"Kader ironiye aşıktır. İki 3, üç 2 harften oluşur.\"\n@Levent8263"
-    return rapor
-
-# --- 3. TELEGRAM KOMUTU ---
-# --- /debug KOMUTU ---
-# Bir hissenin isyatirim'den gelen TÜM ham kalem kodlarını ve isimlerini
-# gösterir. Amaç: Hasılat, Stoklar, Ticari Alacaklar gibi henüz kod
-# numarasını bilmediğimiz kalemleri GERÇEK veriden bulmak — tahmin
-# etmek yerine. Çıktıyı görüp doğru kodları koda ekleyeceğiz.
-@bot.message_handler(commands=['debug'])
-def handle_debug(message):
-    try:
-        komut = message.text.split()
-        if len(komut) < 2:
-            bot.reply_to(message, "Örnek: /debug EREGL")
-            return
-        hisse_kodu = komut[1].upper()
-        bot.reply_to(message, f"🔍 {hisse_kodu} için ham veri kalemleri çekiliyor...")
-
-        guncel_yil = datetime.now().year
-        df = isyatirimhisse.FetchFinancials.fetch_financials(
-            hisse_kodu,
-            start_year=guncel_yil - 1,
-            end_year=guncel_yil,
-        )
-        if df is None or df.empty:
-            bot.reply_to(message, "❌ Veri bulunamadı.")
-            return
-
-        # Sütun isimlerini göster (hangi dönemler geldi?)
-        kolon_metni = "📋 **Gelen dönem sütunları:**\n" + ", ".join([str(c) for c in df.columns]) + "\n\n"
-        bot.reply_to(message, kolon_metni)
-
-        # Her kalem kodu + Türkçe ismini listele (tekrar etmeden)
-        if 'FINANCIAL_ITEM_CODE' in df.columns and 'FINANCIAL_ITEM_NAME_TR' in df.columns:
-            satirlar = []
-            for _, row in df.iterrows():
-                kod = row.get('FINANCIAL_ITEM_CODE', '?')
-                isim = row.get('FINANCIAL_ITEM_NAME_TR', '?')
-                satirlar.append(f"{kod} → {isim}")
-            # Telegram mesaj uzunluğu sınırlı, parçalara bölerek gönder
-            metin = "\n".join(satirlar)
-            for i in range(0, len(metin), 3500):
-                bot.reply_to(message, metin[i:i+3500])
-        else:
-            bot.reply_to(message, "⚠️ FINANCIAL_ITEM_CODE/NAME_TR sütunları bulunamadı, DataFrame yapısı beklenenden farklı.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Hata: {str(e)}")
+        await processing_msg.delete()
+        await update.message.reply_text("\n".join(header_blocks), parse_mode=ParseMode.HTML)
+        for period_name in PERIOD_NAMES:
+            block = format_period_block(period_name, results.get(period_name, {"hata": "sonuç yok"}))
+            await update.message.reply_text(block, parse_mode=ParseMode.HTML)
 
 
-@bot.message_handler(commands=['hesapla'])
-def handle_hesapla(message):
-    try:
-        komut = message.text.split()
-        if len(komut) < 2:
-            bot.reply_to(message, "Örnek: /hesapla VESBE  (veya ABD için: /hesapla AAPL)")
-            return
-        bot.reply_to(message, f"🔍 {komut[1].upper()} analiz ediliyor...")
-        _t_toplam = time.time()
-        rapor = hesapla_ve_rapor_ver(komut[1].upper())
-        print(f"⏱️ [{komut[1].upper()}] TOPLAM /hesapla süresi: {time.time() - _t_toplam:.2f}s")
-        bot.reply_to(message, rapor)
-    except Exception as e:
-        bot.reply_to(message, f"❌ Hata: {str(e)}")
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN tanımlı değil. Ortam değişkenlerini kontrol edin.")
 
-print("🤖 Borsa Botu başarıyla başlatıldı. Telegram mesajları bekleniyor...")
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_symbol))
 
-# --- YENİ: KENDİNİ İYİLEŞTİREN BAŞLATMA DÖNGÜSÜ ---
-# Sorun: bot.infinity_polling(), 409 "Conflict" hatası (genelde redeploy
-# sırasında eski konteynerin tam kapanmadan yeni konteynerin başlamasından
-# kaynaklanan geçici bir çakışma) aldığında SESSİZCE devam etmiyor,
-# hatayı fırlatıp TÜM SÜRECİ ÇÖKERTİYORDU. Bu da Railway'in botu manuel
-# yeniden başlatmasını gerektiriyordu. Artık bunu dıştan bir döngüyle
-# sarmalıyoruz: çökerse birkaç saniye bekleyip KENDİSİ tekrar dener,
-# Railway'in ayrıca müdahale etmesine gerek kalmaz.
-while True:
-    try:
-        bot.remove_webhook()
-        time.sleep(1)
-    except Exception as e:
-        print(f"⚠️ remove_webhook sırasında hata (görmezden gelinebilir): {e}")
+    logger.info("Bot başlatıldı, mesajlar bekleniyor...")
+    app.run_polling()
 
-    try:
-        bot.infinity_polling()
-    except Exception as e:
-        print(f"🔴 Bot çöktü: {e}. 10 saniye bekleyip yeniden başlatılıyor...")
-        time.sleep(10)
+
+if __name__ == "__main__":
+    main()
