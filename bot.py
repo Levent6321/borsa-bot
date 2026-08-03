@@ -605,10 +605,10 @@ def basit_dcf_deger(net_kar, toplam_hisse, buyume=DCF_BUYUME_ORANI,
     nakit_akisi = net_kar
     for yil_no in range(1, yil + 1):
         nakit_akisi = nakit_akisi * (1 + buyume)
-        pv_toplam += nakit_akisi / ((1 + iskonto) ** yil_no)
+        pv_toplam += nakit_akisi / ((1 + iskonto) * yil_no)
 
     terminal_deger = nakit_akisi * (1 + terminal_buyume) / (iskonto - terminal_buyume)
-    pv_terminal = terminal_deger / ((1 + iskonto) ** yil)
+    pv_terminal = terminal_deger / ((1 + iskonto) * yil)
 
     toplam_deger = pv_toplam + pv_terminal
     return toplam_deger / toplam_hisse
@@ -726,7 +726,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     def tl(deger):
         return format_para(deger, para_birimi)
 
-    rapor = f"{'🇹🇷' if piyasa == 'BIST' else '🇺🇸'} **{hisse_kodu} KAPSAMLI DEĞERLEME RAPORU** {'🇹🇷' if piyasa == 'BIST' else '🇺🇸'}\n"
+    rapor = f"{'🇹🇷' if piyasa == 'BIST' else '🇺🇸'} *{hisse_kodu} KAPSAMLI DEĞERLEME RAPORU* {'🇹🇷' if piyasa == 'BIST' else '🇺🇸'}\n"
     rapor += f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
     rapor += f"🌍 Piyasa: {piyasa}\n"
     rapor += f"📅 Kullanılan Finansal Dönem: {donem}\n"
@@ -745,12 +745,12 @@ def hesapla_ve_rapor_ver(hisse_kodu):
                 f"dikkate alınmadı).*\n"
             )
     rapor += f"---\n"
-    rapor += f"📈 **Güncel Fiyat:** {tl(f)} {sembol}\n"
-    rapor += f"💠 **HBK (Hisse Başı Kâr):** {tl(hbk)} {sembol}\n"
-    rapor += f"💠 **HBDD (Hisse Başı Defter Değeri):** {tl(hbdd)} {sembol}\n"
+    rapor += f"📈 *Güncel Fiyat:* {tl(f)} {sembol}\n"
+    rapor += f"💠 *HBK (Hisse Başı Kâr):* {tl(hbk)} {sembol}\n"
+    rapor += f"💠 *HBDD (Hisse Başı Defter Değeri):* {tl(hbdd)} {sembol}\n"
     rapor += f"---\n\n"
 
-    rapor += f"**🔮 BİLANÇO BAZLI ADİL DEĞERLER:**\n"
+    rapor += f"*🔮 BİLANÇO BAZLI ADİL DEĞERLER:*\n"
     rapor += f"🔹 Graham Değeri: {tl(graham)} {sembol}\n"
     rapor += f"🔹 PD/DD Bazlı Hedef: {tl(hedef_pddd)} {sembol}\n"
     if hedef_fd_favok > 0:
@@ -759,7 +759,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
         rapor += f"🔹 FD/FAVÖK Bazlı Hedef: N/A _(bu şirket için FAVÖK verisi bulunamadı)_\n"
     rapor += f"---\n\n"
 
-    rapor += f"**📈 BÜYÜME VE KÂRLILIK BAZLI ADİL DEĞERLER:**\n"
+    rapor += f"*📈 BÜYÜME VE KÂRLILIK BAZLI ADİL DEĞERLER:*\n"
     rapor += f"🔸 Peter Lynch Değeri: {tl(peter)} {sembol}\n"
     rapor += f"🔸 PEG Rasyosu: {round(peg, 2)}\n"
     if peg > 0:
@@ -775,7 +775,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
     rapor += f"---\n\n"
 
     if ic_sel_deger > 0:
-        rapor += f"⭐ **GENEL ORTALAMA ADİL DEĞER:**\n**{tl(ic_sel_deger)} {sembol}**\n"
+        rapor += f"⭐ *GENEL ORTALAMA ADİL DEĞER:*\n*{tl(ic_sel_deger)} {sembol}*\n"
         rapor += f"_(Graham, Peter Lynch, PD/DD ve FD/FAVÖK ortalaması)_\n"
         # DÜZELTME: kaç yöntemin gerçekten hesaba katıldığı belirtiliyor.
         # Zarar eden şirketlerde Graham ve Peter Lynch sıfırlandığı için
@@ -799,14 +799,14 @@ def hesapla_ve_rapor_ver(hisse_kodu):
 
         if f > ic_sel_deger * 5 or f < ic_sel_deger / 5:
             rapor += (
-                f"\n⚠️ **UYARI:** Piyasa fiyatı ile hesaplanan adil değer arasında "
+                f"\n⚠️ *UYARI:* Piyasa fiyatı ile hesaplanan adil değer arasında "
                 f"olağandışı büyük bir fark var (5 kattan fazla). Sonuçlara "
                 f"temkinli yaklaşın, mümkünse ham verileri manuel kontrol edin.\n"
             )
 
         if pddd and pddd > 8:
             rapor += (
-                f"\n⚠️ **UYARI:** Bu şirketin PD/DD oranı çok yüksek (şu an "
+                f"\n⚠️ *UYARI:* Bu şirketin PD/DD oranı çok yüksek (şu an "
                 f"{round(pddd, 1)}x) — bu genelde hisse geri alımları "
                 f"(buyback) nedeniyle defter değeri çok düşük olan, "
                 f"\"varlık hafif\" (asset-light) şirketlerde görülür (Apple "
@@ -818,7 +818,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
             )
     rapor += f"---\n\n"
 
-    rapor += f"**📌 DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):**\n"
+    rapor += f"*📌 DENEYSEL / BİLGİ AMAÇLI HEDEFLER (Ortalamaya Dahil Değildir):*\n"
     if sektor_bilgi:
         rapor += (
             f"🏭 Sektör: {sektor_bilgi['sektor']} "
@@ -873,7 +873,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
         rapor += f"🔻 PPD Bazlı Hedef: N/A _(şirket zarar ettiği için hesaplanamıyor)_\n"
     rapor += f"---\n\n"
 
-    rapor += f"**🩺 FİNANSAL SAĞLIK:**\n"
+    rapor += f"*🩺 FİNANSAL SAĞLIK:*\n"
     rapor += f"📊 Cari Oran: {round(cari_oran, 2)} ({cari_oran_yorum(cari_oran)})\n"
     if asit_test > 0:
         rapor += f"📊 Asit-Test Oranı: {round(asit_test, 2)} _(ideal: 0,7-1,3)_\n"
@@ -898,7 +898,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
             f"özel bir format ayrımı henüz yapılmadı, dikkatli yorumlayın.*\n"
         )
 
-    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n(\"Acele edip aldığım hiçbir üründen kar edemedim.\")\n\n**Nicolas Darvas**\n@Levent8263"
+    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n(\"Acele edip aldığım hiçbir üründen kar edemedim.\")\n\n*Nicolas Darvas*\n@Levent8263"
     return rapor
 
 
@@ -922,7 +922,7 @@ def handle_debug(message):
             bot.reply_to(message, "❌ Veri bulunamadı.")
             return
 
-        kolon_metni = "📋 **Gelen dönem sütunları:**\n" + ", ".join([str(c) for c in df.columns]) + "\n\n"
+        kolon_metni = "📋 *Gelen dönem sütunları:*\n" + ", ".join([str(c) for c in df.columns]) + "\n\n"
         bot.reply_to(message, kolon_metni)
 
         if 'FINANCIAL_ITEM_CODE' in df.columns and 'FINANCIAL_ITEM_NAME_TR' in df.columns:
@@ -951,7 +951,16 @@ def handle_hesapla(message):
         _t_toplam = time.time()
         rapor = hesapla_ve_rapor_ver(komut[1].upper())
         print(f"⏱️ [{komut[1].upper()}] TOPLAM /hesapla süresi: {time.time() - _t_toplam:.2f}s")
-        bot.reply_to(message, rapor)
+        # DÜZELTME: parse_mode belirtilmediği için Telegram *kalın*/_italik_
+        # işaretlerini hiç yorumlamıyor, olduğu gibi düz metin gösteriyordu.
+        # Rapor Markdown ile gönderiliyor; nadir bir durumda (finansal
+        # kalem isimlerinde beklenmedik bir işaret olması gibi) Markdown
+        # ayrıştırma hatası olursa, bot çökmesin diye düz metne düşülüyor.
+        try:
+            bot.reply_to(message, rapor, parse_mode='Markdown')
+        except Exception as e:
+            print(f"⚠️ Markdown gönderimi başarısız, düz metne düşülüyor: {e}")
+            bot.reply_to(message, rapor)
     except Exception as e:
         bot.reply_to(message, f"❌ Hata: {str(e)}")
 
