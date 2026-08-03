@@ -898,7 +898,7 @@ def hesapla_ve_rapor_ver(hisse_kodu):
             f"özel bir format ayrımı henüz yapılmadı, dikkatli yorumlayın.*\n"
         )
 
-    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\nAcele edip aldığım hiçbir üründen kar edemedim.\n\nNicolas Darvas\n@Levent8263"
+    rapor += f"Temel analizdir, Yatırım tavsiyesi değildir. Lütfen Teknik Grafiklere de Bakınız.\n(\"Acele edip aldığım hiçbir üründen kar edemedim.\")\n\n**Nicolas Darvas**\n@Levent8263"
     return rapor
 
 
