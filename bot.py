@@ -472,7 +472,27 @@ def get_bist_data(hisse_kodu):
         return guncel * carpan, False
 
     net_kar, net_kar_ttm_gercek = ttm_hesapla('3L')
-    favok, favok_ttm_gercek = ttm_hesapla('6A')
+
+    # DÜZELTME: İş Yatırım'ın veri setinde hazır bir FAVÖK kalemi ('6A')
+    # bulunmuyor (TTRAK için /debug ile doğrulandı — tüm kod listesinde
+    # '6A' hiç geçmiyor). Bu yüzden FAVÖK, standart formülle hesaplanıyor:
+    #   FAVÖK = Faaliyet Karı (Zararı) [3DF] + Amortisman Giderleri [4B]
+    # Amortismanın ham veri setinde hangi işaretle (+/-) geldiği garanti
+    # olmadığı için abs() ile mutlak değeri alınıyor (amortisman her
+    # zaman faaliyet karına GERİ EKLENİR, çıkarılmaz).
+    def favok_ttm_hesapla():
+        faaliyet_kari, faaliyet_kari_gercek = ttm_hesapla('3DF')
+        amortisman, amortisman_gercek = ttm_hesapla('4B')
+        if faaliyet_kari == 0 and amortisman == 0:
+            print(f"🔴 [{hisse_kodu}] favok_ttm_hesapla: hem 3DF hem 4B boş geldi")
+            return 0.0, False
+        favok_deger = faaliyet_kari + abs(amortisman)
+        favok_gercek = faaliyet_kari_gercek and amortisman_gercek
+        print(f"🟢 [{hisse_kodu}] favok_ttm_hesapla: faaliyet_kari={faaliyet_kari}, amortisman={amortisman} → FAVÖK={favok_deger}")
+        return favok_deger, favok_gercek
+
+    favok, favok_ttm_gercek = favok_ttm_hesapla()
+
     hasilat, hasilat_ttm_gercek = ttm_hesapla('3C')
     satislarin_maliyeti_ham, cogs_ttm_gercek = ttm_hesapla('3CA')
     satislarin_maliyeti = abs(satislarin_maliyeti_ham)
